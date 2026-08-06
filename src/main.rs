@@ -1,0 +1,2108 @@
+//! revpick — flat mtime-sorted file picker TUI (spec: revpick-spec.md).
+//!
+//! Lists every file under a project root, newest first, clustered into
+//! Today / Yesterday / This week / Last week / This month / Older.
+//! Space multi-selects, Enter hands the files to `--open-cmd` (default
+//! `mdcomment`), blocks until it exits, then rescans. `/` filters
+//! incrementally, `t` cycles the sort, Ctrl+h toggles hidden dirs, `d`
+//! toggles directories, `y` copies paths. Without `--open-cmd`, Enter
+//! prints the selected paths to stdout and exits (generic picker, fzf
+//! model); with it, Enter launches the command, blocks, and rescans
+//! (the mdcomment review-loop flow).
+//!
+//! The root resolves from: the positional argument → herdr (`HERDR_ENV=1`
+//! → `herdr worktree list` → `herdr agent list`) → the current directory.
+//!
+//! This prototype shares mdcomment's `highlight` module (syntect) so it
+//! can later move into the mdcomment repo as `src/bin/revpick.rs`.
+
+mod clipboard;
+mod files;
+mod herdr;
+mod highlight;
+mod preview;
+mod theme;
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use chrono::TimeZone;
+use ratatui::Frame;
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::{Hide, Show};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Terminal;
+
+use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, to_local};
+use crate::highlight::Highlighter;
+use crate::preview::{Preview, PreviewKey};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Light-mode default syntax theme (used when light was auto-detected and
+/// no `--theme` was given; the dark default lives in highlight.rs as
+/// `DEFAULT_THEME`).
+const DEFAULT_THEME_LIGHT: &str = "Solarized (light)";
+/// Event poll/tick cadence, ms.
+const TICK_MS: u64 = 100;
+/// Events processed per frame at most (mdcomment's anti-freeze pattern:
+/// a burst is drained once and drawn once).
+const MAX_EVENTS_PER_FRAME: usize = 64;
+/// Transient footer messages live this long.
+const STATUS_SECS: Duration = Duration::from_secs(4);
+/// How often the listing silently refreshes for external changes.
+const REFRESH_TICK: Duration = Duration::from_secs(2);
+
+/// Command-line configuration (spec: 起動 → フラグ).
+struct Config {
+    /// Explicit directory argument (spec priority 1); `None` = herdr → cwd.
+    dir: Option<PathBuf>,
+    /// Initial sort order (`--sort mtime|ctime`; the `t` key cycles).
+    sort: Sort,
+    /// `--show-hidden`: show dot-files on startup.
+    show_hidden: bool,
+    /// `--show-dirs`: show directories on startup.
+    show_dirs: bool,
+    /// `--open-cmd <command>`: Enter spawns this with `{}` / `{1}`..
+    /// placeholders. `None` (the default) = Enter prints the selected
+    /// paths to stdout and exits (generic picker, fzf model).
+    open_cmd: Option<String>,
+    /// `--filter <text>`: initial filter applied at startup (same
+    /// matching as the `/` key; empty = no filter).
+    filter: String,
+    /// `--preview <on|off|auto>`: preview pane behavior (default auto).
+    preview: PreviewMode,
+    /// `--files`: no TUI — print the collected list to stdout and exit
+    /// (the time-ordered listing as a data source for pipes/fzf).
+    files: bool,
+    /// `--format <path|tsv>` (with `--files`): path only, or
+    /// `mtime<TAB>path` for a displayable time column.
+    format: OutputFormat,
+    /// `--since <today|yesterday|Nd|Nw>` (with `--files`): only entries
+    /// modified at/after the cutoff.
+    since: Option<Since>,
+    /// `--output`: Enter prints the selected paths to stdout and exits.
+    output: bool,
+    /// `--theme <name>`: syntect theme name or path to a `.tmTheme`
+    /// file (default: highlight.rs's `DEFAULT_THEME`; `Solarized (light)`
+    /// when the light mode was auto-detected and no theme was given).
+    theme: Option<String>,
+    /// `--light` / `--dark`: force the TUI's light/dark mode.
+    /// `None` (the default) = auto-detect the terminal background via
+    /// OSC 11, falling back to dark when the terminal doesn't answer.
+    light: Option<bool>,
+}
+
+/// What the process should do, resolved from argv.
+enum Action {
+    Run(Config),
+    Help,
+    Version,
+}
+
+/// Preview pane behavior (`--preview`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreviewMode {
+    /// Always show the preview pane.
+    On,
+    /// Never show it (the list takes the full width).
+    Off,
+    /// Show it, but hide it on narrow terminals (list takes the full
+    /// width below [`PREVIEW_MIN_WIDTH`] columns).
+    Auto,
+}
+
+impl PreviewMode {
+    /// Parse `--preview <on|off|auto>`; `None` for unknown values.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "on" => Some(PreviewMode::On),
+            "off" => Some(PreviewMode::Off),
+            "auto" => Some(PreviewMode::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// `auto` hides the preview below this terminal width.
+const PREVIEW_MIN_WIDTH: u16 = 80;
+
+/// `--files` output format.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputFormat {
+    /// One path per line.
+    Path,
+    /// `YYYY-MM-DD HH:MM:SS<TAB>basename<TAB>path` — three fields so fzf
+    /// can display a time column and/or the bare file name while the
+    /// full path stays available for previews:
+    /// `--with-nth 1..2` (time+name), `--with-nth 2` (name only),
+    /// `--preview 'bat {3}'` (full path).
+    Tsv,
+}
+
+/// `--since` cutoff (`--files` only): entries modified at/after this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Since {
+    /// Start of today.
+    Today,
+    /// Start of yesterday.
+    Yesterday,
+    /// N days (or weeks via `Nw`) before now.
+    Days(i64),
+}
+
+impl Since {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "today" => Some(Since::Today),
+            "yesterday" => Some(Since::Yesterday),
+            _ => {
+                // The unit is the last CHARACTER, not the last byte —
+                // `--since 5日` must parse-fail, not panic mid-char.
+                let mut chars = s.chars();
+                let unit = chars.next_back()?;
+                let n: i64 = chars.as_str().parse().ok().filter(|&n| n >= 0)?;
+                match unit {
+                    'd' => Some(Since::Days(n)),
+                    'w' => Some(Since::Days(n * 7)),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The cutoff as a `SystemTime`, relative to `now` (local).
+    fn cutoff(&self, now: chrono::DateTime<chrono::Local>) -> std::time::SystemTime {
+        match self {
+            Since::Today => {
+                let midnight = now
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight exists");
+                let dt = chrono::Local
+                    .from_local_datetime(&midnight)
+                    .single()
+                    .expect("midnight is unambiguous");
+                dt.into()
+            }
+            Since::Yesterday => {
+                let midnight = (now.date_naive() - chrono::Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight exists");
+                let dt = chrono::Local
+                    .from_local_datetime(&midnight)
+                    .single()
+                    .expect("midnight is unambiguous");
+                dt.into()
+            }
+            Since::Days(n) => {
+                let dt = now - chrono::Duration::days(*n);
+                dt.into()
+            }
+        }
+    }
+}
+
+/// The next argument as `flag`'s value; an error when the flag is last
+/// (a flag missing its value must not be silently ignored).
+fn flag_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<String> {
+    it.next().with_context(|| format!("{flag} requires a value"))
+}
+
+impl Config {
+    fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Action> {
+        let mut dir: Option<PathBuf> = None;
+        let mut sort = Sort::MtimeDesc;
+        let mut show_hidden = false;
+        let mut show_dirs = false;
+        let mut open_cmd: Option<String> = None;
+        let mut filter = String::new();
+        let mut preview = PreviewMode::Auto;
+        let mut files = false;
+        let mut format = OutputFormat::Path;
+        let mut since: Option<Since> = None;
+        let mut output = false;
+        let mut theme: Option<String> = None;
+        let mut light: Option<bool> = None;
+        let mut it = args.into_iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(Action::Help),
+                "-V" | "--version" => return Ok(Action::Version),
+                "--show-hidden" => show_hidden = true,
+                "--show-dirs" => show_dirs = true,
+                "--output" => output = true,
+                "--theme" => theme = Some(flag_value(&mut it, "--theme")?),
+                "--light" => light = Some(true),
+                "--dark" => light = Some(false),
+                "--sort" => {
+                    let v = flag_value(&mut it, "--sort")?;
+                    sort = match Sort::parse(&v) {
+                        Some(s) => s,
+                        None => bail!("invalid --sort value: {v} (expected mtime|ctime)"),
+                    };
+                }
+                "--open-cmd" => open_cmd = Some(flag_value(&mut it, "--open-cmd")?),
+                "--filter" => filter = flag_value(&mut it, "--filter")?,
+                "--preview" => {
+                    let v = flag_value(&mut it, "--preview")?;
+                    preview = match PreviewMode::parse(&v) {
+                        Some(m) => m,
+                        None => bail!("invalid --preview value: {v} (expected on|off|auto)"),
+                    };
+                }
+                "--files" => files = true,
+                "--format" => {
+                    let v = flag_value(&mut it, "--format")?;
+                    format = match v.as_str() {
+                        "path" => OutputFormat::Path,
+                        "tsv" => OutputFormat::Tsv,
+                        _ => bail!("invalid --format value: {v} (expected path|tsv)"),
+                    };
+                }
+                "--since" => {
+                    let v = flag_value(&mut it, "--since")?;
+                    since = match Since::parse(&v) {
+                        Some(s) => Some(s),
+                        None => bail!(
+                            "invalid --since value: {v} (expected today|yesterday|Nd|Nw)"
+                        ),
+                    };
+                }
+                other if !other.starts_with('-') && dir.is_none() => {
+                    dir = Some(PathBuf::from(other))
+                }
+                // Typos must fail loudly — a silently ignored flag looks
+                // like it worked (`--outpu` would just open the TUI).
+                other => bail!("unexpected argument: {other} (see --help)"),
+            }
+        }
+        if output && open_cmd.is_some() {
+            bail!("--output and --open-cmd are mutually exclusive");
+        }
+        Ok(Action::Run(Config {
+            dir,
+            sort,
+            show_hidden,
+            show_dirs,
+            open_cmd,
+            filter,
+            preview,
+            files,
+            format,
+            since,
+            output,
+            theme,
+            light,
+        }))
+    }
+
+    fn from_env() -> Result<Action> {
+        Self::parse(std::env::args().skip(1))
+    }
+}
+
+/// Directory resolution priority (spec): explicit arg → herdr → cwd.
+fn resolve_root(dir: Option<&Path>) -> Result<PathBuf> {
+    let root = match dir {
+        Some(p) => p.to_path_buf(),
+        None => match herdr::resolve_root() {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        },
+    };
+    std::fs::canonicalize(&root).with_context(|| format!("resolving {}", root.display()))
+}
+
+fn main() -> Result<()> {
+    match Config::from_env()? {
+        Action::Help => {
+            print_line(
+                "revpick — flat mtime-sorted file picker\n\
+                 \n\
+                 usage: revpick [directory] [flags]\n\
+                 \n\
+                 \x20 directory     project root (default: herdr workspace → cwd)\n\
+                 \x20 --sort <mtime|ctime>  initial sort basis (default mtime)\n\
+                 \x20 --show-hidden  show dot-directories on startup (dot-files\n\
+                 \x20                   are always listed; Ctrl+h/Backspace toggles)\n\
+                 \x20 --show-dirs    show directories on startup (d toggles)\n\
+                 \x20 --open-cmd <command> Enter spawns this with the selected files\n\
+                 \x20                   (none by default — Enter prints the paths to\n\
+                 \x20                   stdout and exits; {{}} = all paths, {{1}}.. per-file)\n\
+                 \x20 --filter <text>   initial filter (same matching as `/`,\n\
+                 \x20                   e.g. `.md` for markdown only)\n\
+                 \x20 --preview <on|off|auto>  preview pane (default auto:\n\
+                 \x20                   hidden below 80 columns)\n\
+                 \x20 --theme <name>    syntect theme name or path to a\n\
+                 \x20                   .tmTheme file (default: Catppuccin\n\
+                 \x20                   Mocha; Solarized (light) in light mode)\n\
+                 \x20 --light           force light mode (default: auto-detect\n\
+                 \x20                   the terminal background via OSC 11)\n\
+                 \x20 --dark            force dark mode\n\
+                 \x20 --files         no TUI: print the time-sorted listing\n\
+                 \x20 --format <path|tsv>  --files output (tsv = time column)\n\
+                 \x20 --since <today|yesterday|Nd|Nw>  --files cutoff\n\
+                 \x20 --output       explicit output mode (same as the default;\n\
+                 \x20                   exclusive with --open-cmd)\n\
+                 \n\
+                 keys:\n\
+                 \x20 j/k/arrows     move   g/G  top/bottom\n\
+                 \x20 PgUp/PgDn Ctrl+u/Ctrl+d  half page\n\
+                 \x20 Space          select/unselect   Enter  open (blocks, then rescan)\n\
+                 \x20 y              copy full paths to clipboard\n\
+                 \x20 /              incremental filter (Enter apply, Esc clear)\n\
+                 \x20 \\              toggle the filter off/on (text is kept)\n\
+                 \x20 t              sort cycle: mtime↓ mtime↑ ctime↓ ctime↑\n\
+                 \x20 Ctrl+h/Backspace  toggle hidden dirs   d  toggle directories\n\
+                 \x20 q              quit   Esc  clear selection"
+            )?;
+            Ok(())
+        }
+        Action::Version => {
+            print_line(&format!("revpick {VERSION}"))?;
+            Ok(())
+        }
+        Action::Run(config) => run(config),
+    }
+}
+
+/// One row of the visible (filtered, clustered) list.
+enum Row {
+    /// A cluster separator — never a cursor target (spec).
+    Separator(Cluster),
+    /// A file row; index into `App::files`.
+    File(usize),
+}
+
+/// TUI state.
+struct App {
+    config: Config,
+    /// Scan root (canonical).
+    root: PathBuf,
+    /// All collected entries, in the current sort order.
+    files: Vec<FileEntry>,
+    /// Visible rows: cluster separators + filtered files.
+    visible: Vec<Row>,
+    /// Cursor position: index into `visible` (always a `Row::File`).
+    cursor: usize,
+    /// Scroll offset: index into `visible` of the first drawn row.
+    offset: usize,
+    /// Space-selected entries: indices into `files`.
+    selected: BTreeSet<usize>,
+    /// Incremental filter text (`/`); empty = no filter.
+    filter: String,
+    /// Whether the filter applies (`\` toggles; the text is kept while
+    /// off, so toggling back restores the same view — vim's
+    /// `:nohlsearch` model).
+    filter_on: bool,
+    /// `--since` cutoff (startup time filter; also applies to the TUI so
+    /// `revpick --since 1d` browses today's files with the preview).
+    since: Option<Since>,
+    /// True while the filter input line is open.
+    filter_active: bool,
+    /// Current sort order (`t` cycles).
+    sort: Sort,
+    show_hidden: bool,
+    show_dirs: bool,
+    /// syntect highlighter shared with mdcomment (two-face themes).
+    highlight: Highlighter,
+    /// Resolved UI colors for the current light/dark mode (mdcomment's
+    /// `--light` pattern: the same constants, resolved once at startup).
+    ui_selected_bg: Color,
+    ui_border: Color,
+    /// Preview pane cache: re-rendered only when the key changes.
+    preview_cache: Option<(PreviewKey, Preview)>,
+    /// Transient footer message (+ error flag → red + BEL).
+    status: Option<(String, Instant, bool)>,
+    /// `--output` mode: paths to print after the TUI shuts down.
+    pending_output: Option<Vec<PathBuf>>,
+    /// Set after resuming from a child process: the event loop skips the
+    /// event drain and draws immediately (the alternate screen was blank).
+    needs_immediate_redraw: bool,
+    /// Last time the listing was refreshed for external changes.
+    last_refresh: Instant,
+    /// Refresh cadence: [`REFRESH_TICK`], backed off after a slow scan so
+    /// a huge tree doesn't freeze the UI thread every tick (the scan runs
+    /// synchronously in the event loop).
+    refresh_every: Duration,
+    running: bool,
+}
+
+impl App {
+    /// The `files` index under the cursor, if any.
+    fn cursor_file_idx(&self) -> Option<usize> {
+        match self.visible.get(self.cursor) {
+            Some(Row::File(i)) => Some(*i),
+            _ => None,
+        }
+    }
+
+    fn cursor_file(&self) -> Option<&FileEntry> {
+        self.cursor_file_idx().map(|i| &self.files[i])
+    }
+
+    /// The selected entries' paths. The selection is index-based, so any
+    /// reorder or replacement of `files` must remap it through these.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected
+            .iter()
+            .map(|&i| self.files[i].path.clone())
+            .collect()
+    }
+
+    /// Re-sort `files` in place for the current sort order, keeping the
+    /// selection on the same files (`t` key — without the remap the
+    /// selected indices would silently point at whatever files the
+    /// reorder happened to put on them).
+    fn resort_files(&mut self) {
+        let selected = self.selected_paths();
+        files::sort_entries(&mut self.files, self.sort);
+        self.selected = selected
+            .iter()
+            .filter_map(|p| self.files.iter().position(|f| &f.path == p))
+            .collect();
+    }
+
+    /// The file (or files) Enter / y / --output operate on: the Space
+    /// selection when non-empty, else the cursor file (spec).
+    fn target_paths(&self) -> Vec<PathBuf> {
+        if !self.selected.is_empty() {
+            self.selected_paths()
+        } else {
+            self.cursor_file()
+                .map(|e| e.path.clone())
+                .into_iter()
+                .collect()
+        }
+    }
+
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), Instant::now(), false));
+    }
+
+    fn flash_err(&mut self, msg: impl Into<String>) {
+        use std::io::Write;
+        let mut out = std::io::stderr();
+        let _ = out.write_all(b"\x07");
+        let _ = out.flush();
+        self.status = Some((msg.into(), Instant::now(), true));
+    }
+
+    /// Rebuild `visible` from `files` (filter + clusters), then place the
+    /// cursor on `cursor_path` if it is still listed, else on the first
+    /// file. `cursor_path` = `None` keeps the current cursor file.
+    fn rebuild_visible(&mut self, cursor_path: Option<&Path>) {
+        let want = match cursor_path {
+            Some(p) => Some(p.to_path_buf()),
+            None => self.cursor_file().map(|e| e.path.clone()),
+        };
+        let now = chrono::Local::now();
+        let cutoff = self.since.map(|s| s.cutoff(now));
+        let needle = files::prepare_filter(&self.filter);
+        let mut visible: Vec<Row> = Vec::new();
+        let mut last_cluster: Option<Cluster> = None;
+        for (i, e) in self.files.iter().enumerate() {
+            if self.filter_on && !files::matches_prepared(e, &needle) {
+                continue;
+            }
+            if cutoff.is_some_and(|c| e.mtime < c) {
+                continue;
+            }
+            let c = cluster_of(to_local(e.mtime), now);
+            if last_cluster != Some(c) {
+                last_cluster = Some(c);
+                visible.push(Row::Separator(c));
+            }
+            visible.push(Row::File(i));
+        }
+        self.visible = visible;
+        // Cursor: prefer the preserved file, else the first file row.
+        self.cursor = want
+            .and_then(|p| {
+                self.visible
+                    .iter()
+                    .position(|r| matches!(r, Row::File(i) if self.files[*i].path == p))
+            })
+            .unwrap_or_else(|| first_file_row(&self.visible));
+    }
+
+    /// Re-scan the root, re-sort, remap the selection by path, and rebuild
+    /// the visible list (used after child exits and on toggle changes).
+    fn rescan(&mut self) {
+        match files::scan(&self.root, self.show_hidden, self.show_dirs) {
+            Ok(mut entries) => {
+                files::sort_entries(&mut entries, self.sort);
+                self.commit_scan(entries);
+            }
+            Err(e) => self.flash_err(format!("rescan failed: {e:#}")),
+        }
+    }
+
+    /// Periodic silent refresh: re-scan and commit only when the listing
+    /// actually changed (an agent editing files while revpick is open
+    /// floats the touched files up on its own — the preview cache and
+    /// cursor/selection survive when nothing changed).
+    fn refresh_if_changed(&mut self) {
+        let started = Instant::now();
+        let Ok(mut entries) = files::scan(&self.root, self.show_hidden, self.show_dirs) else {
+            return; // transient scan errors are silent here
+        };
+        files::sort_entries(&mut entries, self.sort);
+        // The scan blocks the event loop: after a slow one (huge tree),
+        // back off to a ~10% duty cycle instead of freezing every tick.
+        self.refresh_every = REFRESH_TICK.max(started.elapsed() * 10);
+        if entries != self.files {
+            self.commit_scan(entries);
+        }
+    }
+
+    /// Adopt a fresh scan (already in the current sort order): remap the
+    /// selection and cursor by path, rebuild the visible list, and drop
+    /// the preview cache.
+    fn commit_scan(&mut self, entries: Vec<FileEntry>) {
+        let selected_paths = self.selected_paths();
+        let cursor_path = self.cursor_file().map(|e| e.path.clone());
+        self.files = entries;
+        self.selected = selected_paths
+            .iter()
+            .filter_map(|p| self.files.iter().position(|f| &f.path == p))
+            .collect();
+        self.preview_cache = None;
+        self.rebuild_visible(cursor_path.as_deref());
+    }
+
+    /// Whether the preview pane is shown this frame.
+    fn preview_visible(&self) -> bool {
+        match self.config.preview {
+            PreviewMode::On => true,
+            PreviewMode::Off => false,
+            PreviewMode::Auto => {
+                let w = ratatui::crossterm::terminal::size()
+                    .map(|(w, _)| w)
+                    .unwrap_or(PREVIEW_MIN_WIDTH);
+                w >= PREVIEW_MIN_WIDTH
+            }
+        }
+    }
+
+    /// The cursor file's preview for the pane geometry, cached.
+    fn preview_for(&mut self, width: usize, height: usize) -> Option<&Preview> {
+        let e = self.cursor_file()?;
+        let key = PreviewKey {
+            path: e.path.clone(),
+            mtime: e.mtime,
+            size: e.size,
+            width,
+            height,
+        };
+        if !self.preview_cache.as_ref().is_some_and(|(k, _)| *k == key) {
+            let p = preview::render(
+                &e.path,
+                e.size,
+                e.is_dir,
+                width,
+                height,
+                &self.highlight,
+            );
+            self.preview_cache = Some((key, p));
+        }
+        Some(&self.preview_cache.as_ref().expect("just filled").1)
+    }
+
+    /// Number of file rows currently listed.
+    fn visible_count(&self) -> usize {
+        self.visible
+            .iter()
+            .filter(|r| matches!(r, Row::File(_)))
+            .count()
+    }
+
+    /// The scroll offset corrected so the cursor row stays in view
+    /// (clamped to the scrollable range; used by draw and the mouse).
+    fn effective_offset(&self, list_h: usize) -> usize {
+        let list_h = list_h.max(1);
+        let max = self.visible.len().saturating_sub(list_h);
+        let mut off = self.offset.min(max);
+        if self.cursor < off {
+            off = self.cursor;
+        } else if self.cursor >= off + list_h {
+            off = self.cursor + 1 - list_h;
+        }
+        off.min(max)
+    }
+}
+
+/// The first file row index in `visible` (0 when there are none).
+fn first_file_row(visible: &[Row]) -> usize {
+    visible
+        .iter()
+        .position(|r| matches!(r, Row::File(_)))
+        .unwrap_or(0)
+}
+
+/// Snap a row position to the nearest file row (separators are never
+/// cursor targets — spec).
+fn clamp_to_file(visible: &[Row], mut row: usize) -> usize {
+    if visible.is_empty() {
+        return 0;
+    }
+    row = row.min(visible.len() - 1);
+    for i in row..visible.len() {
+        if matches!(visible[i], Row::File(_)) {
+            return i;
+        }
+    }
+    for i in (0..=row).rev() {
+        if matches!(visible[i], Row::File(_)) {
+            return i;
+        }
+    }
+    0
+}
+
+/// Print one line to stdout, treating a closed pipe as a silent stop
+/// (the consumer quit early — e.g. `revpick --files | fzf` when fzf
+/// exits first). Rust's `println!` panics on EPIPE, which would dump a
+/// stack trace into the user's terminal.
+fn print_line(line: &str) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    match writeln!(out, "{line}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `--files` mode: scan, filter (--filter / --since), print, exit.
+/// The listing is the same one the TUI shows — herdr resolution,
+/// gitignore, always-on ignores, hidden/dirs toggles, sort — but as
+/// plain lines for `revpick --files | fzf` and friends.
+fn run_files(config: &Config) -> Result<()> {
+    let root = resolve_root(config.dir.as_deref())?;
+    let mut entries = files::scan(&root, config.show_hidden, config.show_dirs)?;
+    files::sort_entries(&mut entries, config.sort);
+    let now = chrono::Local::now();
+    for e in filter_entries(entries, &config.filter, config.since, now) {
+        let line = match config.format {
+            OutputFormat::Path => e.path.display().to_string(),
+            OutputFormat::Tsv => {
+                let t = to_local(e.mtime);
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| e.path.display().to_string());
+                format!(
+                    "{}\t{name}\t{}",
+                    t.format("%Y-%m-%d %H:%M:%S"),
+                    e.path.display()
+                )
+            }
+        };
+        print_line(&line)?;
+    }
+    Ok(())
+}
+
+/// Apply the `--filter` text and the `--since` cutoff to a scanned list
+/// (pure, so the `--files` behavior is unit-testable).
+fn filter_entries(
+    entries: Vec<FileEntry>,
+    filter: &str,
+    since: Option<Since>,
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<FileEntry> {
+    let needle = files::prepare_filter(filter);
+    entries
+        .into_iter()
+        .filter(|e| {
+            files::matches_prepared(e, &needle)
+                && since.is_none_or(|s| e.mtime >= s.cutoff(now))
+        })
+        .collect()
+}
+
+/// The number of list rows that fit: terminal height minus the outer
+/// border (2) and the footer (2).
+fn list_height(terminal_h: u16) -> usize {
+    terminal_h.saturating_sub(4).max(1) as usize
+}
+
+/// The pane rectangles for the full terminal `area`:
+/// `(list, preview, footer)`. Shared by draw and the mouse handler so
+/// clicks map to exactly the geometry that was drawn.
+fn pane_layout(area: Rect, preview_on: bool) -> (Rect, Rect, Rect) {
+    // The outer block's border eats one cell on every side.
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    // The content area excludes the footer's two rows, so neither pane
+    // can bleed into it.
+    let content = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
+    let (list, preview) = if preview_on {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(55),
+            Constraint::Length(1),
+            Constraint::Min(20),
+        ])
+        .split(content[0]);
+        (cols[0], cols[2])
+    } else {
+        (content[0], Rect::default())
+    };
+    (list, preview, content[1])
+}
+
+/// The TUI terminal: crossterm over a boxed writer (stdout, or /dev/tty
+/// when stdout is piped).
+type Term = Terminal<CrosstermBackend<Box<dyn std::io::Write>>>;
+
+/// Build the terminal. When stdout is piped, the TUI renders on the
+/// controlling terminal (/dev/tty) so the pipe carries only the selected
+/// paths (`revpick . | xargs mdcomment` — the generic picker use).
+/// Without a tty available the stdout writer is kept as a fallback.
+fn make_terminal() -> Result<Term> {
+    use std::io::IsTerminal;
+    let writer: Box<dyn std::io::Write> = if !std::io::stdout().is_terminal() {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map(|f| Box::new(f) as Box<dyn std::io::Write>)
+            .unwrap_or_else(|_| Box::new(std::io::stdout()))
+    } else {
+        Box::new(std::io::stdout())
+    };
+    Ok(Terminal::new(CrosstermBackend::new(writer))?)
+}
+
+/// When stdin is not a terminal (xargs gives children /dev/null; scripts
+/// redirect it), rebind fd 0 to a real tty so crossterm's event reader
+/// can initialize. On macOS this must be the actual pty slave: /dev/tty
+/// is a synthetic node that kqueue (mio) rejects with EINVAL, and
+/// crossterm's own /dev/tty fallback therefore fails with "Failed to
+/// initialize input reader" (`revpick --files | xargs mdcomment` dies).
+fn ensure_terminal_stdin() {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if rebind_to_controlling_pty() {
+        return;
+    }
+    // Other platforms (and macOS without a matching pty): the controlling
+    // terminal node itself — epoll etc. accept it, so crossterm works.
+    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both fds are valid; dup2 replaces fd 0 with the tty.
+        unsafe {
+            libc::dup2(tty.as_raw_fd(), libc::STDIN_FILENO);
+        }
+    }
+}
+
+/// macOS: find the real pty slave whose foreground process group is ours
+/// (the controlling terminal's `tcgetpgrp` == our `getpgrp`) and rebind
+/// stdin to it. Returns whether a match was found and dup2'ed.
+#[cfg(target_os = "macos")]
+fn rebind_to_controlling_pty() -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let me = unsafe { libc::getpgrp() };
+    let Ok(rd) = std::fs::read_dir("/dev") else { return false };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("ttys") {
+            continue;
+        }
+        let path = format!("/dev/{name}");
+        let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)
+        else {
+            continue;
+        };
+        if unsafe { libc::tcgetpgrp(f.as_raw_fd()) } == me {
+            // SAFETY: valid fds; rebind stdin to the real tty.
+            unsafe {
+                libc::dup2(f.as_raw_fd(), libc::STDIN_FILENO);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn run(config: Config) -> Result<()> {
+    // `--files`: the time-ordered listing as a data source (pipes, fzf).
+    // No TUI → no tty juggling either (ensure_terminal_stdin scans
+    // /dev/ttys* on macOS; pointless without an event loop).
+    if config.files {
+        return run_files(&config);
+    }
+    ensure_terminal_stdin();
+    let root = resolve_root(config.dir.as_deref())?;
+    // Light/dark resolution: --light/--dark win, else the terminal's
+    // background is queried (OSC 11). The query needs raw mode (the
+    // answer is plain bytes on stdin), so raw mode is enabled before
+    // the App is built; unanswerable terminals fall back to dark.
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let light = config
+        .light
+        .unwrap_or_else(|| theme::detect_light().unwrap_or(false));
+    // The syntax theme: --theme wins; otherwise the light mode picks a
+    // light-readable default (the dark default is highlight.rs's).
+    let highlight = Highlighter::new(
+        config
+            .theme
+            .as_deref()
+            .or_else(|| light.then_some(DEFAULT_THEME_LIGHT)),
+        light,
+    );
+    let mut app = App {
+        config,
+        root: root.clone(),
+        files: Vec::new(),
+        visible: Vec::new(),
+        cursor: 0,
+        offset: 0,
+        selected: BTreeSet::new(),
+        filter: String::new(),
+        filter_on: true,
+        since: None,
+        filter_active: false,
+        sort: Sort::MtimeDesc,
+        show_hidden: false,
+        show_dirs: false,
+        highlight,
+        ui_selected_bg: theme::selected_bg(light),
+        ui_border: theme::border_color(light),
+        preview_cache: None,
+        status: None,
+        pending_output: None,
+        needs_immediate_redraw: false,
+        last_refresh: Instant::now(),
+        refresh_every: REFRESH_TICK,
+        running: true,
+    };
+    // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
+    // cycle them at runtime.
+    app.sort = app.config.sort;
+    app.show_hidden = app.config.show_hidden;
+    app.show_dirs = app.config.show_dirs;
+    // The `--filter`/`--since` seeds apply to the first scan; `/` edits
+    // the filter later.
+    app.filter = app.config.filter.clone();
+    app.since = app.config.since;
+    app.rescan();
+    if app.files.is_empty() {
+        let failed = app.status.as_ref().is_some_and(|(_, _, err)| *err);
+        if !failed {
+            app.flash("no files found");
+        }
+    }
+
+    let mut terminal = match make_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            // Raw mode is already on: restore it before bailing, or the
+            // user's shell is left in raw mode.
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
+    };
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, Hide, EnableMouseCapture);
+    let res = event_loop(&mut terminal, &mut app);
+    let _ = execute!(terminal.backend_mut(), Show, DisableMouseCapture, LeaveAlternateScreen);
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    // `--output` mode: the paths print only after the TUI is fully down,
+    // to the (piped) stdout — the TUI rendered on /dev/tty, so the pipe
+    // carries nothing but the paths.
+    if let Some(paths) = app.pending_output {
+        for p in paths {
+            print_line(&p.display().to_string())?;
+        }
+    }
+    res
+}
+
+fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
+    terminal.draw(|f| draw(f, app))?;
+    loop {
+        if event::poll(Duration::from_millis(TICK_MS))? {
+            for _ in 0..MAX_EVENTS_PER_FRAME {
+                // A child process just exited and the terminal was
+                // re-initialized: draw now, don't drain stale events.
+                if app.needs_immediate_redraw {
+                    app.needs_immediate_redraw = false;
+                    break;
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        on_key(app, key.code, key.modifiers, Some(terminal))
+                    }
+                    Event::Mouse(mouse) => on_mouse(app, mouse),
+                    _ => {}
+                }
+            }
+        }
+        terminal.draw(|f| draw(f, app))?;
+        // Silent refresh: an external edit (the agent rewriting files)
+        // replaces the listing within a tick; cursor/selection follow by
+        // path, so the display just "becomes" the new state.
+        if app.last_refresh.elapsed() >= app.refresh_every {
+            app.last_refresh = Instant::now();
+            app.refresh_if_changed();
+        }
+        if app
+            .status
+            .as_ref()
+            .is_some_and(|(_, at, _)| at.elapsed() > STATUS_SECS)
+        {
+            app.status = None;
+        }
+        if !app.running {
+            return Ok(());
+        }
+    }
+}
+
+fn on_key(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+    terminal: Option<&mut Term>,
+) {
+    if app.filter_active {
+        return on_filter_key(app, key, modifiers);
+    }
+    let height = list_height(
+        ratatui::crossterm::terminal::size()
+            .map(|(_, h)| h)
+            .unwrap_or(24),
+    );
+    match key {
+        // Legacy terminals encode Ctrl+h as BS (0x08) — indistinguishable
+        // from the Backspace key there, so plain Backspace is the same
+        // hidden-dirs toggle (documented in --help).
+        KeyCode::Backspace => toggle_hidden(app),
+        KeyCode::Char('j') | KeyCode::Down => {
+            let mut row = app.cursor;
+            while row + 1 < app.visible.len() {
+                row += 1;
+                if matches!(app.visible[row], Row::File(_)) {
+                    break;
+                }
+            }
+            app.cursor = row;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            let mut row = app.cursor;
+            while row > 0 {
+                row -= 1;
+                if matches!(app.visible[row], Row::File(_)) {
+                    break;
+                }
+            }
+            app.cursor = row;
+        }
+        KeyCode::Char('g') => app.cursor = first_file_row(&app.visible),
+        KeyCode::Char('G') => {
+            app.cursor = clamp_to_file(&app.visible, app.visible.len().saturating_sub(1))
+        }
+        // NOTE: a match guard applies to ALL or-patterns of an arm, so
+        // PageDown/PageUp get their own guard-free arms — sharing the
+        // Ctrl+d/Ctrl+u arm would make plain PgDn/PgUp dead keys.
+        KeyCode::PageDown => half_page_down(app, height),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            half_page_down(app, height)
+        }
+        KeyCode::PageUp => half_page_up(app, height),
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            half_page_up(app, height)
+        }
+        KeyCode::Char(' ') => {
+            if let Some(i) = app.cursor_file_idx() {
+                if !app.selected.remove(&i) {
+                    app.selected.insert(i);
+                }
+            }
+        }
+        KeyCode::Enter => open_selection(app, terminal),
+        KeyCode::Char('y') => copy_paths(app),
+        KeyCode::Char('/') => app.filter_active = true,
+        KeyCode::Char('t') => {
+            app.sort = app.sort.next();
+            app.resort_files();
+            app.preview_cache = None;
+            app.rebuild_visible(None);
+        }
+        KeyCode::Char('h') if modifiers.contains(KeyModifiers::CONTROL) => toggle_hidden(app),
+        KeyCode::Char('d') => {
+            app.show_dirs = !app.show_dirs;
+            app.flash(if app.show_dirs {
+                "directories shown"
+            } else {
+                "directories hidden"
+            });
+            app.rescan();
+        }
+        KeyCode::Char('q') => app.running = false,
+        // Filter on/off toggle: the text is preserved, so `\` again
+        // restores the same view (`--filter` is the context's default
+        // view; this is the quick way to step out of it and back).
+        KeyCode::Char('\\') => {
+            app.filter_on = !app.filter_on;
+            app.flash(if app.filter_on {
+                "filter on"
+            } else {
+                "filter off — showing all"
+            });
+            app.rebuild_visible(None);
+        }
+        KeyCode::Esc => {
+            app.selected.clear();
+        }
+        _ => {}
+    }
+}
+
+/// Ctrl+h / Backspace: toggle dot-directory visibility. Dot-FILES
+/// (`.gitignore` etc.) are always listed; only dot-directories
+/// (`.claude/`, `.github/`, …) are hidden by default (spec layout).
+fn toggle_hidden(app: &mut App) {
+    app.show_hidden = !app.show_hidden;
+    app.flash(if app.show_hidden {
+        "hidden dirs shown"
+    } else {
+        "hidden dirs hidden"
+    });
+    app.rescan();
+}
+
+/// Half-page cursor movement (PgDn / Ctrl+d, PgUp / Ctrl+u).
+fn half_page_down(app: &mut App, height: usize) {
+    app.cursor = clamp_to_file(&app.visible, app.cursor + (height / 2).max(1));
+}
+
+fn half_page_up(app: &mut App, height: usize) {
+    app.cursor = clamp_to_file(&app.visible, app.cursor.saturating_sub((height / 2).max(1)));
+}
+
+/// The filter input line: every key goes to the buffer (incremental — the
+/// list re-filters on each keystroke).
+fn on_filter_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    match key {
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            // Typing re-applies the filter (incremental).
+            app.filter_on = true;
+            app.filter.push(c);
+            app.rebuild_visible(None);
+        }
+        KeyCode::Backspace => {
+            app.filter.pop();
+            app.rebuild_visible(None);
+        }
+        // Esc cancels the filter entirely (spec: フィルタ解除).
+        KeyCode::Esc => {
+            app.filter.clear();
+            app.filter_on = false;
+            app.filter_active = false;
+            app.rebuild_visible(None);
+        }
+        // Enter applies and closes the input (empty = no filter).
+        KeyCode::Enter => {
+            app.filter_on = true;
+            app.filter_active = false;
+            app.rebuild_visible(None);
+        }
+        _ => {}
+    }
+}
+
+/// Enter: with `--open-cmd` given, hand the target files to it (blocking),
+/// then rescan; without one (or with `--output`) queue the paths for
+/// stdout and exit — the generic picker behavior.
+fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
+    let paths = app.target_paths();
+    if paths.is_empty() {
+        app.flash_err("no files");
+        return;
+    }
+    if app.config.output || app.config.open_cmd.is_none() {
+        app.pending_output = Some(paths);
+        app.running = false;
+        return;
+    }
+    let cmd = expand_cmd(app.config.open_cmd.as_deref().expect("checked above"), &paths);
+    // Suspend the TUI while the child owns the terminal (mdcomment's
+    // editor pattern): leave the alternate screen and raw mode.
+    if let Some(t) = terminal.as_deref_mut() {
+        let _ = execute!(t.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
+    }
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    let status = Command::new("sh").arg("-c").arg(&cmd).status();
+    // Re-enter raw mode and rebuild a fresh terminal for the TUI.
+    let _ = ratatui::crossterm::terminal::enable_raw_mode();
+    if let Some(t) = terminal {
+        match make_terminal() {
+            Ok(term) => {
+                *t = term;
+                let _ = execute!(t.backend_mut(), EnterAlternateScreen, Hide, EnableMouseCapture);
+            }
+            Err(e) => {
+                app.flash_err(format!("terminal restore failed: {e:#}"));
+                app.running = false;
+            }
+        }
+    }
+    // The child may have edited files: rescan so fresh mtimes float up
+    // (spec flow step 4-5).
+    app.rescan();
+    match status {
+        Ok(s) if s.success() => app.flash("done — list rescanned"),
+        Ok(s) => app.flash_err(format!(
+            "command exited with {}",
+            s.code().map_or_else(|| "signal".to_string(), |c| c.to_string())
+        )),
+        Err(e) => app.flash_err(format!("spawn failed: {e}")),
+    }
+    app.needs_immediate_redraw = true;
+}
+
+/// `y`: copy the target files' full paths to the clipboard.
+fn copy_paths(app: &mut App) {
+    let paths = app.target_paths();
+    if paths.is_empty() {
+        app.flash_err("no files");
+        return;
+    }
+    let text = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    match clipboard::copy_to_clipboard(&text) {
+        Ok(()) => app.flash(format!(
+            "{} path{} copied",
+            paths.len(),
+            if paths.len() == 1 { "" } else { "s" }
+        )),
+        Err(e) => app.flash_err(format!("clipboard: {e:#}")),
+    }
+}
+
+/// Expand `--open-cmd` placeholders (spec): `{}` = all paths space-joined,
+/// `{1}` `{2}`.. = the Nth path. Without any substituted placeholder the
+/// paths are appended. Every path is shell-quoted.
+///
+/// Single pass over the command text only: substituted paths are never
+/// rescanned. (Sequential `str::replace` calls would re-substitute
+/// placeholders INSIDE already-inserted paths — a file named `x{2}.md`
+/// would corrupt the quoting and open a shell-injection surface.)
+fn expand_cmd(cmd: &str, paths: &[PathBuf]) -> String {
+    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    let mut out = String::with_capacity(cmd.len());
+    let mut substituted = false;
+    let mut rest = cmd;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        let Some(close) = tail.find('}') else {
+            // No closing brace anywhere: the remainder is literal.
+            rest = tail;
+            break;
+        };
+        let inner = &tail[1..close];
+        if inner.is_empty() {
+            out.push_str(&quoted.join(" "));
+            substituted = true;
+        } else if let Some(q) = inner
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| quoted.get(i))
+        {
+            out.push_str(q);
+            substituted = true;
+        } else {
+            // Not a placeholder ({x}) or out of range ({9} with 2 files):
+            // kept literal.
+            out.push_str(&tail[..=close]);
+        }
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    if substituted {
+        out
+    } else {
+        format!("{out} {}", quoted.join(" "))
+    }
+}
+
+/// Single-quote a path for `sh -c` (paths with spaces must survive).
+fn shell_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
+}
+
+fn on_mouse(app: &mut App, mouse: MouseEvent) {
+    // Only the list pane is mouse-driven: wheel scrolls, a click on a
+    // file row moves the cursor.
+    let (w, h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let (list_area, _, _) = pane_layout(Rect::new(0, 0, w, h), app.preview_visible());
+    let list_h = list_height(h);
+    match mouse.kind {
+        MouseEventKind::ScrollDown => scroll_view(app, 1, list_h),
+        MouseEventKind::ScrollUp => scroll_view(app, -1, list_h),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Clicks outside the list pane (border, preview, footer) are
+            // not cursor targets.
+            if mouse.column < list_area.x
+                || mouse.column >= list_area.x + list_area.width
+                || mouse.row < list_area.y
+                || mouse.row >= list_area.y + list_area.height
+            {
+                return;
+            }
+            let row = (mouse.row - list_area.y) as usize;
+            let idx = app.effective_offset(list_h) + row;
+            if idx < app.visible.len() && matches!(app.visible[idx], Row::File(_)) {
+                app.cursor = idx;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Wheel scroll: move the view by `delta` rows, dragging the cursor along
+/// when it would leave the window. Without the drag the wheel is a no-op:
+/// the offset is slaved to the cursor (`effective_offset`), so a view
+/// scrolled past the cursor would snap straight back.
+fn scroll_view(app: &mut App, delta: isize, list_h: usize) {
+    if app.visible.is_empty() {
+        return;
+    }
+    let list_h = list_h.max(1);
+    let max = app.visible.len().saturating_sub(list_h);
+    let new = app
+        .effective_offset(list_h)
+        .saturating_add_signed(delta)
+        .min(max);
+    app.offset = new;
+    let bottom = (new + list_h - 1).min(app.visible.len() - 1);
+    if app.cursor < new {
+        // The cursor fell off the top: snap to the window's first file.
+        app.cursor = clamp_to_file(&app.visible, new);
+    } else if app.cursor > bottom {
+        // Fell off the bottom: snap to the window's last file, searching
+        // upward so the view isn't dragged back down.
+        if let Some(i) = (new..=bottom)
+            .rev()
+            .find(|&i| matches!(app.visible[i], Row::File(_)))
+        {
+            app.cursor = i;
+        }
+    }
+}
+
+/// Draw one frame: outer block (title), list pane, preview pane, footer.
+fn draw(f: &mut Frame, app: &mut App) {
+    let now = chrono::Local::now();
+    let title = format!(
+        "revpick · {} · {} files",
+        app.root.display(),
+        app.visible_count()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.ui_border))
+        .title(Span::styled(title, Style::default().fg(app.ui_border)));
+    let area = f.area();
+    f.render_widget(block, area);
+    let preview_on = app.preview_visible();
+    let (list_area, preview_area, footer_area) = pane_layout(area, preview_on);
+    let list_h = list_height(area.height);
+    let offset = app.effective_offset(list_h);
+
+    // --- left pane: clustered file list -------------------------------
+    let mut list_lines: Vec<Line> = Vec::with_capacity(list_h);
+    let list_width = list_area.width.saturating_sub(1) as usize;
+    if app.visible.is_empty() {
+        list_lines.push(Line::from(Span::styled(
+            if app.filter.is_empty() || !app.filter_on {
+                "no files"
+            } else {
+                "no match"
+            },
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for i in offset..offset.saturating_add(list_h).min(app.visible.len()) {
+        match &app.visible[i] {
+            Row::Separator(c) => list_lines.push(separator_line(c.label(), list_width)),
+            Row::File(idx) => {
+                list_lines.push(file_line(app, *idx, list_width, i == app.cursor, now));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(list_lines), list_area);
+
+    // --- right pane: preview (hidden when --preview off, or auto on a
+    // narrow terminal) ------------------------------------------------
+    let mut preview_lines: Vec<Line> = Vec::new();
+    if preview_on {
+        let ui_border = app.ui_border;
+        if app.cursor_file().is_some() {
+            let pw = preview_area.width.saturating_sub(1) as usize;
+            let ph = preview_area.height.saturating_sub(1) as usize;
+            if let Some(p) = app.preview_for(pw, ph) {
+                preview_lines.push(Line::from(Span::styled(
+                    p.header.clone(),
+                    Style::default().fg(ui_border).add_modifier(Modifier::BOLD),
+                )));
+                preview_lines.extend(p.rows.iter().cloned());
+            }
+        } else {
+            preview_lines.push(Line::from(Span::styled(
+                "(no selection)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(Paragraph::new(preview_lines), preview_area);
+    }
+
+    // --- footer -------------------------------------------------------
+    let mut footer1: Vec<Span> = Vec::new();
+    if app.filter_active {
+        footer1.push(Span::styled(
+            format!("filter: {}", app.filter),
+            Style::default().fg(Color::Yellow),
+        ));
+        footer1.push(Span::raw("▏"));
+        let footer2 = vec![hint("Enter", "apply"), hint("Esc", "clear")];
+        f.render_widget(
+            Paragraph::new(vec![Line::from(footer1), Line::from(footer2)]),
+            footer_area,
+        );
+        return;
+    }
+    footer1.push(Span::styled(
+        format!("[{}]", app.sort.label()),
+        Style::default().fg(Color::White),
+    ));
+    footer1.push(Span::raw(" "));
+    footer1.push(toggle_span("hidden", app.show_hidden));
+    footer1.push(Span::raw(" "));
+    footer1.push(toggle_span("dirs", app.show_dirs));
+    if !app.filter.is_empty() {
+        footer1.push(Span::raw(" "));
+        footer1.push(Span::styled(
+            format!(
+                "[filter:{}{}]",
+                app.filter,
+                if app.filter_on { "" } else { " off" }
+            ),
+            if app.filter_on {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    }
+    if !app.selected.is_empty() {
+        footer1.push(Span::raw(" "));
+        footer1.push(Span::styled(
+            format!("[selected:{}]", app.selected.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let footer2 = vec![
+        hint("Space", "select"),
+        hint("Enter", if app.config.open_cmd.is_some() { "open" } else { "output" }),
+        hint("y", "copy"),
+        hint("/", "filter"),
+        hint("\\", "toggle"),
+        hint("t", "sort"),
+        hint("Ctrl+h", "hidden"),
+        hint("d", "dirs"),
+        hint("q", "quit"),
+    ];
+    if let Some((msg, _, err)) = &app.status {
+        footer1.push(Span::raw("  "));
+        footer1.push(Span::styled(
+            msg.clone(),
+            Style::default().fg(if *err { Color::Red } else { Color::Yellow }),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(vec![Line::from(footer1), Line::from(footer2)]),
+        footer_area,
+    );
+}
+
+fn hint(key: &str, action: &str) -> Span<'static> {
+    Span::styled(
+        format!("{key}:{action}  "),
+        Style::default().fg(Color::DarkGray),
+    )
+}
+
+fn toggle_span(name: &str, on: bool) -> Span<'static> {
+    Span::styled(
+        format!("[{name}]"),
+        if on {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )
+}
+
+fn separator_line(label: &str, width: usize) -> Line<'static> {
+    let head = format!("── {label} ");
+    let fill = "─".repeat(width.saturating_sub(files::display_width(&head)));
+    Line::from(Span::styled(
+        format!("{head}{fill}"),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// One file row: marker + dir part (dimmed gray) + basename (theme fg,
+/// Cyan on the cursor row) + right-aligned datetime (gray; hidden when
+/// the name needs the width — the clusters already carry the time
+/// context, so the name always wins). No icon (2026-08-05: the 📄/📁
+/// emoji was dropped — extension-based reading is enough, per the
+/// spec's no-icon stance). Cursor and Space-selected rows get the
+/// mdcomment gray background (spec).
+fn file_line(
+    app: &App,
+    idx: usize,
+    width: usize,
+    is_cursor: bool,
+    now: chrono::DateTime<chrono::Local>,
+) -> Line<'static> {
+    let e = &app.files[idx];
+    let sel = app.selected.contains(&idx);
+    // Cursor/selection: background change only, on the mdcomment gray.
+    // Only the cursor row's *name* gets a Cyan accent (mdcomment's view
+    // mode); the datetime stays gray — the time is secondary.
+    let base = if is_cursor || sel {
+        Style::default().bg(app.ui_selected_bg)
+    } else {
+        Style::default()
+    };
+    let marker = if is_cursor { "> " } else if sel { "* " } else { "  " };
+    let fg = app.highlight.default_fg();
+    let name_fg = if is_cursor { Color::Cyan } else { fg };
+    // Split the relative path: the directory part is dimmed, the
+    // basename is the star of the row.
+    let rel = e.display_rel();
+    let (dir, name) = match rel.rfind('/') {
+        Some(i) => (&rel[..i + 1], &rel[i + 1..]),
+        None => ("", rel.as_str()),
+    };
+    let name = if e.is_dir {
+        format!("{name}/")
+    } else {
+        name.to_string()
+    };
+    // Layout priority: marker + dir + name fill the row first; the
+    // datetime is right-aligned only when it fits.
+    let dt = format_time(to_local(e.mtime), now);
+    let dt_w = files::display_width(&dt);
+    let avail = width.saturating_sub(files::display_width(marker));
+    let (dir, name) = fit_path(dir, &name, avail);
+    let left_w = files::display_width(&dir) + files::display_width(&name);
+    // At least two columns of gap, or the name butts against the datetime.
+    let show_dt = left_w + dt_w + 2 <= avail;
+    let pad = avail.saturating_sub(left_w + dt_w);
+    let mut spans = vec![
+        Span::styled(marker, base.fg(name_fg)),
+        Span::styled(dir, base.fg(Color::DarkGray)),
+        Span::styled(name, base.fg(name_fg)),
+    ];
+    if show_dt {
+        spans.push(Span::styled(" ".repeat(pad), base));
+        spans.push(Span::styled(dt, base.fg(Color::Gray)));
+    }
+    Line::from(spans)
+}
+
+/// Fit `dir` + `name` into `avail` columns. Sacrifice order (the name is
+/// sacred): the datetime first (the caller hides it), then the dir part
+/// at whole-component boundaries (kept tail — the components closest to
+/// the name carry the most orientation), then the name's head.
+fn fit_path(dir: &str, name: &str, avail: usize) -> (String, String) {
+    let dir_w = files::display_width(dir);
+    let name_w = files::display_width(name);
+    if dir_w + name_w <= avail {
+        return (dir.to_string(), name.to_string());
+    }
+    if name_w >= avail {
+        // The name alone doesn't fit: drop the dir, keep the name's head.
+        return (String::new(), truncate_keep_head(name, avail));
+    }
+    // The dir part shrinks first, at component boundaries.
+    let suffix = truncate_keep_tail(dir, avail - name_w);
+    if suffix.is_empty() {
+        (String::new(), name.to_string())
+    } else {
+        (format!("…/{suffix}"), name.to_string())
+    }
+}
+
+/// The longest prefix of `s` that fits `avail` columns, followed by "…"
+/// when truncated (char-boundary safe).
+fn truncate_keep_head(s: &str, avail: usize) -> String {
+    if files::display_width(s) <= avail {
+        return s.to_string();
+    }
+    if avail == 0 {
+        return String::new();
+    }
+    let keep = avail - 1; // room for the marker
+    let mut w = 0;
+    let mut cut = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > keep {
+            break;
+        }
+        w += cw;
+        cut = i + ch.len_utf8();
+    }
+    format!("{}{}", &s[..cut], "…")
+}
+
+/// The longest suffix of `dir` that fits `avail` columns, kept at
+/// whole-component boundaries (each component with its trailing `/`);
+/// empty when even the last component doesn't fit. The caller adds the
+/// "…/" marker.
+fn truncate_keep_tail(dir: &str, avail: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for comp in dir.split('/').rev() {
+        if comp.is_empty() {
+            continue; // the trailing '/' is implied by the separator
+        }
+        let piece = format!("{comp}/");
+        let pw = files::display_width(&piece);
+        if w + pw > avail {
+            break;
+        }
+        out.insert_str(0, &piece);
+        w += pw;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn run_config(args: &[&str]) -> Config {
+        match Config::parse(args.iter().map(|s| s.to_string())).unwrap() {
+            Action::Run(c) => c,
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn expand_cmd_substitutes_all_and_indexed_placeholders() {
+        let paths = vec![p("/a/one.md"), p("/b/two.md")];
+        assert_eq!(
+            expand_cmd("mdcomment --theme Nord {}", &paths),
+            "mdcomment --theme Nord '/a/one.md' '/b/two.md'"
+        );
+        assert_eq!(
+            expand_cmd("vim -p {1} {2}", &paths),
+            "vim -p '/a/one.md' '/b/two.md'"
+        );
+        // No indexed placeholder and no `{{}}` → paths appended.
+        assert_eq!(
+            expand_cmd("x {3}", &paths),
+            "x {3} '/a/one.md' '/b/two.md'"
+        );
+        // No placeholder → paths appended.
+        assert_eq!(expand_cmd("mdcomment", &paths), "mdcomment '/a/one.md' '/b/two.md'");
+        // Non-numeric braces stay literal (and don't count as substituted).
+        assert_eq!(
+            expand_cmd("awk '{print}'", &paths),
+            "awk '{print}' '/a/one.md' '/b/two.md'"
+        );
+    }
+
+    #[test]
+    fn expand_cmd_never_rescans_substituted_paths() {
+        // A file name containing a placeholder must stay inert data —
+        // sequential str::replace would substitute INSIDE the quoted
+        // path and corrupt the command line (shell-injection surface).
+        let paths = vec![p("/a/x{2}.md"), p("/b/two.md")];
+        assert_eq!(
+            expand_cmd("vim {1} {2}", &paths),
+            "vim '/a/x{2}.md' '/b/two.md'"
+        );
+        let paths = vec![p("/a/x{}.md")];
+        assert_eq!(expand_cmd("mdcomment {}", &paths), "mdcomment '/a/x{}.md'");
+        assert_eq!(expand_cmd("mdcomment {1}", &paths), "mdcomment '/a/x{}.md'");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote(Path::new("/a b/c'd.md")), "'/a b/c'\\''d.md'");
+        assert_eq!(shell_quote(Path::new("/plain.md")), "'/plain.md'");
+    }
+
+    #[test]
+    fn config_parses_flags_and_positional() {
+        let c = run_config(&["/proj", "--sort", "ctime", "--show-hidden", "--show-dirs"]);
+        assert_eq!(c.dir, Some(p("/proj")));
+        assert_eq!(c.sort, Sort::CtimeDesc);
+        assert!(c.show_hidden);
+        assert!(c.show_dirs);
+        assert_eq!(c.open_cmd, None);
+        assert!(!c.output);
+    }
+
+    #[test]
+    fn config_output_is_exclusive_with_open_cmd() {
+        assert!(Config::parse(
+            ["--output".to_string(), "--open-cmd".to_string(), "x".to_string()]
+        )
+        .is_err());
+        assert!(run_config(&["--output"]).output);
+    }
+
+    #[test]
+    fn theme_and_light_flags_parse() {
+        let c = run_config(&["--theme", "Nord"]);
+        assert_eq!(c.theme.as_deref(), Some("Nord"));
+        assert_eq!(c.light, None); // default: auto-detect
+        assert_eq!(run_config(&["--light"]).light, Some(true));
+        assert_eq!(run_config(&["--dark"]).light, Some(false));
+        // The last of --light/--dark wins.
+        assert_eq!(run_config(&["--light", "--dark"]).light, Some(false));
+        // A bare --theme with no value is an error (a silently dropped
+        // flag looks like it worked).
+        assert!(Config::parse(["--theme".to_string()]).is_err());
+    }
+
+    #[test]
+    fn unknown_flags_and_extra_positionals_error() {
+        assert!(Config::parse(["--outpu".to_string()]).is_err()); // typo
+        assert!(Config::parse(["/a".to_string(), "/b".to_string()]).is_err());
+    }
+
+    #[test]
+    fn config_defaults() {
+        let c = run_config(&[]);
+        assert_eq!(c.dir, None); // herdr → cwd resolution
+        assert_eq!(c.sort, Sort::MtimeDesc);
+        assert_eq!(c.open_cmd, None);
+    }
+
+    #[test]
+    fn since_parses_keywords_and_durations() {
+        assert_eq!(Since::parse("today"), Some(Since::Today));
+        assert_eq!(Since::parse("yesterday"), Some(Since::Yesterday));
+        assert_eq!(Since::parse("1d"), Some(Since::Days(1)));
+        assert_eq!(Since::parse("2w"), Some(Since::Days(14)));
+        assert_eq!(Since::parse("bogus"), None);
+        assert_eq!(Since::parse(""), None);
+        // A multibyte unit must parse-fail, not panic on a char boundary.
+        assert_eq!(Since::parse("5日"), None);
+        // Negative cutoffs (a future time) are rejected.
+        assert_eq!(Since::parse("-1d"), None);
+    }
+
+    #[test]
+    fn since_cutoff_is_midnight_for_today() {
+        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 14, 23, 0).unwrap();
+        let cutoff = Since::Today.cutoff(now);
+        let dt: chrono::DateTime<chrono::Local> = cutoff.into();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-05 00:00:00");
+        // 1d = 24h before now, to the second.
+        let cutoff = Since::Days(1).cutoff(now);
+        let dt: chrono::DateTime<chrono::Local> = cutoff.into();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-04 14:23:00");
+    }
+
+    #[test]
+    fn filter_entries_applies_text_and_since() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 12, 0, 0).unwrap();
+        let mk = |rel: &str, age_h: u64| FileEntry {
+            path: p(&format!("/r/{rel}")),
+            rel: p(rel),
+            mtime: UNIX_EPOCH + Duration::from_secs(now.timestamp() as u64 - age_h * 3600),
+            ctime: UNIX_EPOCH,
+            is_dir: false,
+            size: 0,
+        };
+        let entries = vec![
+            mk("a.md", 1),   // 1h ago
+            mk("b.rs", 30),  // 30h ago
+            mk("c.md", 200), // 200h ago
+        ];
+        // --since 2d keeps a.md and b.rs.
+        let out = filter_entries(entries.clone(), "", Some(Since::Days(2)), now);
+        let names: Vec<&str> = out.iter().map(|e| e.rel.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["a.md", "b.rs"]);
+        // --filter .md keeps only the markdown files.
+        let out = filter_entries(entries.clone(), ".md", None, now);
+        let names: Vec<&str> = out.iter().map(|e| e.rel.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["a.md", "c.md"]);
+        // Both combined.
+        let out = filter_entries(entries, ".md", Some(Since::Days(1)), now);
+        let names: Vec<&str> = out.iter().map(|e| e.rel.to_str().unwrap()).collect();
+        assert_eq!(names, vec!["a.md"]);
+    }
+
+    #[test]
+    fn files_flag_parses() {
+        let c = run_config(&["--files"]);
+        assert!(c.files);
+        assert_eq!(c.format, OutputFormat::Path);
+        let c = run_config(&["--files", "--format", "tsv", "--since", "1d"]);
+        assert_eq!(c.format, OutputFormat::Tsv);
+        assert_eq!(c.since, Some(Since::Days(1)));
+        // Invalid --since/--format values are errors, not silent no-ops.
+        assert!(Config::parse(["--since".to_string(), "bogus".to_string()]).is_err());
+        assert!(Config::parse(["--format".to_string(), "bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn preview_flag_parses_modes() {
+        assert_eq!(run_config(&["--preview", "on"]).preview, PreviewMode::On);
+        assert_eq!(run_config(&["--preview", "off"]).preview, PreviewMode::Off);
+        assert_eq!(run_config(&["--preview", "auto"]).preview, PreviewMode::Auto);
+        assert!(Config::parse(["--preview".to_string(), "bogus".to_string()]).is_err());
+        assert_eq!(run_config(&[]).preview, PreviewMode::Auto); // default
+    }
+
+    #[test]
+    fn filter_flag_seeds_the_initial_filter() {
+        let c = run_config(&["--filter", ".md"]);
+        assert_eq!(c.filter, ".md");
+        // Default: no filter.
+        assert_eq!(run_config(&[]).filter, "");
+        // A bare `--filter` with no value is an error.
+        assert!(Config::parse(["--filter".to_string()]).is_err());
+    }
+
+    #[test]
+    fn open_cmd_is_optional() {
+        let c = run_config(&["--open-cmd", "vim -p {}"]);
+        assert_eq!(c.open_cmd.as_deref(), Some("vim -p {}"));
+        // A bare `--open-cmd` with no value is an error.
+        assert!(Config::parse(["--open-cmd".to_string()]).is_err());
+    }
+
+    #[test]
+    fn sort_flag_parses_and_rejects_unknown() {
+        assert_eq!(run_config(&["--sort", "mtime"]).sort, Sort::MtimeDesc);
+        assert_eq!(run_config(&["--sort", "ctime"]).sort, Sort::CtimeDesc);
+        assert!(Config::parse(["--sort".to_string(), "bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn help_and_version_short_circuit() {
+        assert!(matches!(Config::parse(["--help".to_string()]), Ok(Action::Help)));
+        assert!(matches!(Config::parse(["-V".to_string()]), Ok(Action::Version)));
+    }
+
+    #[test]
+    fn clamp_to_file_skips_separators() {
+        // visible: [Sep(Today), File(0), File(1), Sep(Yesterday), File(2)]
+        let visible = vec![
+            Row::Separator(Cluster::Today),
+            Row::File(0),
+            Row::File(1),
+            Row::Separator(Cluster::Yesterday),
+            Row::File(2),
+        ];
+        assert_eq!(clamp_to_file(&visible, 0), 1);
+        assert_eq!(clamp_to_file(&visible, 4), 4);
+        assert_eq!(clamp_to_file(&visible, 3), 4); // separator → next file
+        assert_eq!(clamp_to_file(&visible, 2), 2);
+        assert_eq!(clamp_to_file(&visible, 99), 4);
+    }
+
+    #[test]
+    fn filter_toggle_keeps_text_and_reveals_all() {
+        let mut app = App {
+            config: run_config(&["--filter", ".md"]),
+            root: p("/r"),
+            files: vec![
+                FileEntry {
+                    path: p("/r/a.md"),
+                    rel: p("a.md"),
+                    mtime: std::time::UNIX_EPOCH,
+                    ctime: std::time::UNIX_EPOCH,
+                    is_dir: false,
+                    size: 0,
+                },
+                FileEntry {
+                    path: p("/r/b.rs"),
+                    rel: p("b.rs"),
+                    mtime: std::time::UNIX_EPOCH,
+                    ctime: std::time::UNIX_EPOCH,
+                    is_dir: false,
+                    size: 0,
+                },
+            ],
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: ".md".into(),
+            filter_on: true,
+            since: None,
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            running: true,
+        };
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 1, "filter applies when on");
+        // Toggle off: everything shows, the text is kept.
+        app.filter_on = false;
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 2, "all files when filter is off");
+        assert_eq!(app.filter, ".md", "the filter text survives the toggle");
+        // Toggle back on: the same filtered view returns.
+        app.filter_on = true;
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 1, "filter restores when toggled on");
+    }
+
+    #[test]
+    fn since_applies_in_the_tui_listing() {
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+        // rebuild_visible compares against the real clock (Local::now()),
+        // so mtimes must be relative to it — a fixed date turns into a
+        // time bomb the day the calendar passes it.
+        let now = chrono::Local::now();
+        let mk = |rel: &str, age_h: u64| FileEntry {
+            path: p(&format!("/r/{rel}")),
+            rel: p(rel),
+            mtime: UNIX_EPOCH
+                + StdDuration::from_secs(now.timestamp() as u64 - age_h * 3600),
+            ctime: UNIX_EPOCH,
+            is_dir: false,
+            size: 0,
+        };
+        let mut app = App {
+            config: run_config(&[]),
+            root: p("/r"),
+            files: vec![mk("new.md", 1), mk("old.md", 30)],
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: String::new(),
+            filter_on: true,
+            since: Some(Since::Days(1)),
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            running: true,
+        };
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 1, "--since 1d keeps only the fresh file");
+    }
+
+    #[test]
+    fn effective_offset_keeps_cursor_visible() {
+        let mut app = App {
+            config: run_config(&[]),
+            root: p("/r"),
+            files: Vec::new(),
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: String::new(),
+            filter_on: true,
+            since: None,
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            running: true,
+        };
+        // 10 file rows, 5 visible; cursor at 9.
+        app.visible = (0..10).map(|i| Row::File(i)).collect();
+        app.cursor = 9;
+        assert_eq!(app.effective_offset(5), 5);
+        app.offset = 99;
+        assert_eq!(app.effective_offset(5), 5); // clamped to max
+        app.cursor = 0;
+        app.offset = 5;
+        assert_eq!(app.effective_offset(5), 0); // pulled back up
+    }
+
+    #[test]
+    fn fit_path_keeps_name_full_before_truncating() {
+        // Fits: nothing truncated.
+        assert_eq!(fit_path("src/util/", "main.rs", 20), ("src/util/".into(), "main.rs".into()));
+        // Name + dir overflow: the dir shrinks at component boundaries,
+        // keeping the tail (components closest to the name).
+        assert_eq!(fit_path("src/util/", "main.rs", 14), ("…/util/".into(), "main.rs".into()));
+        assert_eq!(fit_path("a/very/long/dir/", "main.rs", 20), ("…/long/dir/".into(), "main.rs".into()));
+        // Not even one dir component fits: the dir is dropped entirely.
+        assert_eq!(fit_path("src/util/", "main.rs", 8), ("".into(), "main.rs".into()));
+        // The name alone doesn't fit: its head is kept with "…".
+        assert_eq!(fit_path("", "main.rs", 4), ("".into(), "mai…".into()));
+        assert_eq!(fit_path("src/", "main.rs", 4), ("".into(), "mai…".into()));
+        // Root-level files: no dir part.
+        assert_eq!(fit_path("", "README.md", 20), ("".into(), "README.md".into()));
+    }
+
+    #[test]
+    fn truncate_keep_head_is_char_boundary_safe() {
+        assert_eq!(truncate_keep_head("main.rs", 5), "main…");
+        assert_eq!(truncate_keep_head("main.rs", 20), "main.rs");
+        // CJK: 日(2) fits keep=3, 本 would overflow.
+        assert_eq!(truncate_keep_head("日本語.rs", 4), "日…");
+        assert_eq!(truncate_keep_head("main.rs", 0), "");
+        assert_eq!(truncate_keep_head("main.rs", 1), "…");
+    }
+
+    #[test]
+    fn truncate_keep_tail_keeps_whole_components() {
+        assert_eq!(truncate_keep_tail("src/util/", 5), "util/");
+        assert_eq!(truncate_keep_tail("src/util/", 9), "src/util/");
+        assert_eq!(truncate_keep_tail("src/util/", 4), ""); // even "util/" (5) doesn't fit
+        assert_eq!(truncate_keep_tail("a/b/c/", 3), "c/");
+        assert_eq!(truncate_keep_tail("a/b/c/", 2), "c/"); // exactly fits
+    }
+
+    /// A bare App over the given entries (TUI-less unit tests).
+    fn test_app(files: Vec<FileEntry>) -> App {
+        App {
+            config: run_config(&[]),
+            root: p("/r"),
+            files,
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: String::new(),
+            filter_on: true,
+            since: None,
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            running: true,
+        }
+    }
+
+    #[test]
+    fn sort_cycle_keeps_selection_on_the_same_files() {
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+        let mk = |rel: &str, secs: u64| FileEntry {
+            path: p(&format!("/r/{rel}")),
+            rel: p(rel),
+            mtime: UNIX_EPOCH + StdDuration::from_secs(secs),
+            ctime: UNIX_EPOCH + StdDuration::from_secs(secs),
+            is_dir: false,
+            size: 0,
+        };
+        // mtime↓: b.md (20) sits at index 0, a.md (10) at index 1.
+        let mut app = test_app(vec![mk("b.md", 20), mk("a.md", 10)]);
+        app.selected.insert(0); // b.md
+        app.sort = app.sort.next(); // mtime↑ — reverses the order
+        app.resort_files();
+        // The selection must follow the file, not the slot: without the
+        // remap, index 0 would now mean a.md.
+        assert_eq!(app.selected_paths(), vec![p("/r/b.md")]);
+    }
+
+    #[test]
+    fn wheel_scroll_moves_view_and_drags_cursor() {
+        let mut app = test_app(Vec::new());
+        app.visible = (0..10).map(Row::File).collect();
+        // 5-row window, cursor at the top: scrolling down used to be a
+        // no-op (effective_offset snapped the view back to the cursor).
+        scroll_view(&mut app, 1, 5);
+        assert_eq!(app.offset, 1);
+        assert_eq!(app.cursor, 1, "cursor is dragged along the top edge");
+        // The offset clamps at len - list_h no matter how far we scroll.
+        for _ in 0..20 {
+            scroll_view(&mut app, 1, 5);
+        }
+        assert_eq!(app.offset, 5);
+        // Cursor at the bottom: scrolling up drags it along the bottom edge.
+        app.cursor = 9;
+        app.offset = 5;
+        scroll_view(&mut app, -1, 5);
+        assert_eq!(app.offset, 4);
+        assert_eq!(app.cursor, 8, "cursor snaps to the window's last row");
+    }
+}
