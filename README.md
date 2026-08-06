@@ -91,6 +91,7 @@ Directory resolution order: explicit argument → herdr (`HERDR_ENV=1`: worktree
 
 - Rust + [ratatui](https://ratatui.rs) 0.30; file collection via the `ignore` crate.
 - Preview reads at most the first 256 KB; binaries show `file(1)`-style info instead of crashing.
+- Speed-first preview: while you hold j/k (key repeat) the pane shows a placeholder so each cursor move costs only the list draw; the real preview catches up ~40 ms after you release the key.
 - Light/dark auto-detection queries the terminal background with OSC 11 (falls back to dark).
 - Deliberately not: tree views, preview scrolling, fuzzy matching, alphabetical sort, icon fonts. See [docs/spec.md](docs/spec.md).
 

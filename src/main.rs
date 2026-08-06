@@ -56,6 +56,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_THEME_LIGHT: &str = "Solarized (light)";
 /// Event poll/tick cadence, ms.
 const TICK_MS: u64 = 100;
+/// Input events closer together than this are a "burst" (held j/k repeat,
+/// fast wheel scrolls): the preview render is deferred while bursting so
+/// every cursor move costs only the list draw (speed-first spec — the
+/// preview catches up the moment the input pauses).
+const BURST_GAP: Duration = Duration::from_millis(40);
 /// Events processed per frame at most (akapen's anti-freeze pattern:
 /// a burst is drained once and drawn once).
 const MAX_EVENTS_PER_FRAME: usize = 64;
@@ -437,6 +442,14 @@ struct App {
     /// a huge tree doesn't freeze the UI thread every tick (the scan runs
     /// synchronously in the event loop).
     refresh_every: Duration,
+    /// When the last input event arrived (burst tracking, see
+    /// [`mark_input`]).
+    last_input: Instant,
+    /// True while input events arrive faster than [`BURST_GAP`] apart
+    /// (the user is mashing j/k): the preview pane shows a placeholder
+    /// instead of re-rendering per key (speed first; see
+    /// [`App::preview_lines`]).
+    bursting: bool,
     running: bool,
 }
 
@@ -597,9 +610,24 @@ impl App {
         }
     }
 
-    /// The cursor file's preview for the pane geometry, cached.
-    fn preview_for(&mut self, width: usize, height: usize) -> Option<&Preview> {
-        let e = self.cursor_file()?;
+    /// The preview pane's lines for the cursor file. Speed-first render
+    /// policy: a cached preview is drawn as-is (so j/k alternation
+    /// between already-seen files never stalls); a fresh render happens
+    /// only when input is deliberate (not bursting); while the user is
+    /// mashing j/k the pane shows the header + "…" placeholder, which
+    /// costs nothing — each cursor move is a list-only draw. The real
+    /// preview catches up the moment the input pauses (see
+    /// [`event_loop`]).
+    fn preview_lines(&mut self, width: usize, height: usize) -> Vec<Line<'static>> {
+        let header_style = Style::default()
+            .fg(self.ui_border)
+            .add_modifier(Modifier::BOLD);
+        let Some(e) = self.cursor_file() else {
+            return vec![Line::from(Span::styled(
+                "(no selection)",
+                Style::default().fg(Color::DarkGray),
+            ))];
+        };
         let key = PreviewKey {
             path: e.path.clone(),
             mtime: e.mtime,
@@ -607,18 +635,31 @@ impl App {
             width,
             height,
         };
-        if !self.preview_cache.as_ref().is_some_and(|(k, _)| *k == key) {
-            let p = preview::render(
-                &e.path,
-                e.size,
-                e.is_dir,
-                width,
-                height,
-                &self.highlight,
-            );
-            self.preview_cache = Some((key, p));
+        let header = Line::from(Span::styled(
+            preview::header_for(&e.path, e.is_dir),
+            header_style,
+        ));
+        if let Some((_, p)) = self.preview_cache.as_ref().filter(|(k, _)| *k == key) {
+            let mut lines = vec![header];
+            lines.extend(p.rows.iter().cloned());
+            return lines;
         }
-        Some(&self.preview_cache.as_ref().expect("just filled").1)
+        if self.bursting {
+            // Input burst in progress: defer the render (speed first).
+            return vec![
+                header,
+                Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+        }
+        let p = preview::render(&e.path, e.size, e.is_dir, width, height, &self.highlight);
+        self.preview_cache = Some((key, p));
+        let p = &self.preview_cache.as_ref().expect("just filled").1;
+        let mut lines = vec![header];
+        lines.extend(p.rows.iter().cloned());
+        lines
     }
 
     /// Number of file rows currently listed.
@@ -902,6 +943,8 @@ fn run(config: Config) -> Result<()> {
         needs_immediate_redraw: false,
         last_refresh: Instant::now(),
         refresh_every: REFRESH_TICK,
+        last_input: Instant::now(),
+        bursting: false,
         running: true,
     };
     // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
@@ -948,7 +991,19 @@ fn run(config: Config) -> Result<()> {
 fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     terminal.draw(|f| draw(f, app))?;
     loop {
-        if event::poll(Duration::from_millis(TICK_MS))? {
+        // Burst-aware poll: while the user is mashing j/k the preview is
+        // deferred (see mark_input / preview_lines), and the poll wakes
+        // exactly when the burst ends so the final preview pops ~BURST_GAP
+        // after the key is released instead of waiting out the full tick.
+        let timeout = if app.bursting {
+            let quiet = app.last_input.elapsed();
+            Duration::from_millis(TICK_MS)
+                .min((BURST_GAP - quiet).max(Duration::from_millis(5)))
+        } else {
+            Duration::from_millis(TICK_MS)
+        };
+        let mut any_input = false;
+        if event::poll(timeout)? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 // A child process just exited and the terminal was
                 // re-initialized: draw now, don't drain stale events.
@@ -960,13 +1015,29 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                     break;
                 }
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        on_key(app, key.code, key.modifiers, Some(terminal))
+                    Event::Key(key) => {
+                        mark_input(app);
+                        any_input = true;
+                        // Release/Repeat kinds (kitty protocol) don't
+                        // drive the UI, but they still count as input
+                        // for the burst tracker.
+                        if key.kind == KeyEventKind::Press {
+                            on_key(app, key.code, key.modifiers, Some(terminal));
+                        }
                     }
-                    Event::Mouse(mouse) => on_mouse(app, mouse),
+                    Event::Mouse(mouse) => {
+                        mark_input(app);
+                        any_input = true;
+                        on_mouse(app, mouse);
+                    }
                     _ => {}
                 }
             }
+        }
+        if !any_input && app.bursting && app.last_input.elapsed() >= BURST_GAP {
+            // The burst ended without a trailing event (the key was
+            // released): the placeholder gives way to the real preview.
+            app.bursting = false;
         }
         terminal.draw(|f| draw(f, app))?;
         // Silent refresh: an external edit (the agent rewriting files)
@@ -1087,6 +1158,17 @@ fn on_key(
         }
         _ => {}
     }
+}
+
+/// Record an input event for the burst tracker. Events arriving closer
+/// than [`BURST_GAP`] to the previous one put the UI into "mashing" mode
+/// (held j/k repeat, fast wheel scrolls): the preview render is deferred
+/// until the input pauses, so every cursor move costs only the list draw.
+/// A deliberate press after a pause renders the preview immediately.
+fn mark_input(app: &mut App) {
+    let now = Instant::now();
+    app.bursting = now.duration_since(app.last_input) < BURST_GAP;
+    app.last_input = now;
 }
 
 /// Ctrl+h / Backspace: toggle dot-directory visibility. Dot-FILES
@@ -1371,26 +1453,10 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // --- right pane: preview (hidden when --preview off, or auto on a
     // narrow terminal) ------------------------------------------------
-    let mut preview_lines: Vec<Line> = Vec::new();
     if preview_on {
-        let ui_border = app.ui_border;
-        if app.cursor_file().is_some() {
-            let pw = preview_area.width.saturating_sub(1) as usize;
-            let ph = preview_area.height.saturating_sub(1) as usize;
-            if let Some(p) = app.preview_for(pw, ph) {
-                preview_lines.push(Line::from(Span::styled(
-                    p.header.clone(),
-                    Style::default().fg(ui_border).add_modifier(Modifier::BOLD),
-                )));
-                preview_lines.extend(p.rows.iter().cloned());
-            }
-        } else {
-            preview_lines.push(Line::from(Span::styled(
-                "(no selection)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        f.render_widget(Paragraph::new(preview_lines), preview_area);
+        let pw = preview_area.width.saturating_sub(1) as usize;
+        let ph = preview_area.height.saturating_sub(1) as usize;
+        f.render_widget(Paragraph::new(app.preview_lines(pw, ph)), preview_area);
     }
 
     // --- footer -------------------------------------------------------
@@ -1897,6 +1963,8 @@ mod tests {
             needs_immediate_redraw: false,
             last_refresh: Instant::now(),
             refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
             running: true,
         };
         app.rebuild_visible(None);
@@ -1952,6 +2020,8 @@ mod tests {
             needs_immediate_redraw: false,
             last_refresh: Instant::now(),
             refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
             running: true,
         };
         app.rebuild_visible(None);
@@ -1984,6 +2054,8 @@ mod tests {
             needs_immediate_redraw: false,
             last_refresh: Instant::now(),
             refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
             running: true,
         };
         // 10 file rows, 5 visible; cursor at 9.
@@ -2059,8 +2131,66 @@ mod tests {
             needs_immediate_redraw: false,
             last_refresh: Instant::now(),
             refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
             running: true,
         }
+    }
+
+    #[test]
+    fn burst_tracker_flips_on_rapid_events() {
+        let mut app = test_app(Vec::new());
+        // Startup sets last_input = now; model a press arriving later.
+        app.last_input = Instant::now() - Duration::from_millis(500);
+        mark_input(&mut app); // a deliberate press after a long pause
+        assert!(!app.bursting);
+        std::thread::sleep(Duration::from_millis(10));
+        mark_input(&mut app); // 10ms later: a burst (held j/k repeat)
+        assert!(app.bursting);
+        std::thread::sleep(Duration::from_millis(100));
+        mark_input(&mut app); // a deliberate press after a pause
+        assert!(!app.bursting);
+    }
+
+    #[test]
+    fn preview_defers_while_bursting_and_renders_when_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let x = dir.path().join("x.rs");
+        std::fs::write(&x, "fn main() {}\n// note\n").unwrap();
+        let y = dir.path().join("y.rs");
+        std::fs::write(&y, "fn y() {}\n// hi\n").unwrap();
+        let mk = |p: &std::path::Path, secs: u64| FileEntry {
+            path: p.to_path_buf(),
+            rel: p.file_name().unwrap().into(),
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ctime: std::time::UNIX_EPOCH,
+            is_dir: false,
+            size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        };
+        let mut app = test_app(vec![mk(&x, 0)]);
+        app.rebuild_visible(None);
+        // Deliberate input (not bursting): rendered immediately.
+        let lines = app.preview_lines(40, 10);
+        assert!(lines[0].to_string().contains("x.rs"));
+        assert!(lines.len() > 2, "rendered rows, not a placeholder");
+        // Move to an uncached file while bursting: placeholder only.
+        app.files.push(mk(&y, 1));
+        app.rebuild_visible(None);
+        app.cursor = first_file_row(&app.visible) + 1;
+        app.bursting = true;
+        let lines = app.preview_lines(40, 10);
+        assert_eq!(lines.len(), 2, "header + ellipsis while bursting");
+        assert!(lines[0].to_string().contains("y.rs"));
+        assert!(lines[1].to_string().contains('…'));
+        // Burst over: the real preview renders and caches.
+        app.bursting = false;
+        let lines = app.preview_lines(40, 10);
+        assert!(lines.len() > 2);
+        assert!(lines[0].to_string().contains("y.rs"));
+        // And the cached preview is used even while bursting again.
+        app.bursting = true;
+        let lines = app.preview_lines(40, 10);
+        assert!(lines.len() > 2, "cached preview survives bursts");
     }
 
     #[test]
