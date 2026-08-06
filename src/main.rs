@@ -1366,7 +1366,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 list_lines.push(separator_line(&c.label(now), list_width))
             },
             Row::File(idx) => {
-                list_lines.push(file_line(app, *idx, list_width, i == app.cursor));
+                list_lines.push(file_line(app, *idx, list_width, i == app.cursor, now));
             }
         }
     }
@@ -1493,17 +1493,18 @@ fn separator_line(label: &str, width: usize) -> Line<'static> {
 }
 
 /// One file row: marker + dir part (dimmed gray) + basename (theme fg,
-/// Cyan on the cursor row) + right-aligned time (gray; hidden when
-/// the name needs the width — the cluster headers carry the date
-/// context, so the name always wins). No icon (2026-08-05: the 📄/📁
-/// emoji was dropped — extension-based reading is enough, per the
-/// spec's no-icon stance). Cursor and Space-selected rows get the
-/// akapen gray background (spec).
+/// Cyan on the cursor row) + right-aligned time (gray; `now`/`5m ago`
+/// within 24h, else `HH:MM`; hidden when the name needs the width — the
+/// cluster headers carry the date context, so the name always wins). No
+/// icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
+/// reading is enough, per the spec's no-icon stance). Cursor and
+/// Space-selected rows get the akapen gray background (spec).
 fn file_line(
     app: &App,
     idx: usize,
     width: usize,
     is_cursor: bool,
+    now: chrono::DateTime<chrono::Local>,
 ) -> Line<'static> {
     let e = &app.files[idx];
     let sel = app.selected.contains(&idx);
@@ -1532,7 +1533,7 @@ fn file_line(
     };
     // Layout priority: marker + dir + name fill the row first; the
     // datetime is right-aligned only when it fits.
-    let dt = format_time(to_local(e.mtime));
+    let dt = format_time(now, to_local(e.mtime));
     let dt_w = files::display_width(&dt);
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
