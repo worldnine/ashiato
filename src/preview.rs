@@ -37,6 +37,18 @@ pub struct PreviewKey {
     pub height: usize,
 }
 
+/// The preview pane's header text: the basename for files, the full path
+/// for directories (shared by the renderer and the TUI's speed-first
+/// placeholder, so both always agree on what the pane is showing).
+pub fn header_for(path: &Path, is_dir: bool) -> String {
+    if is_dir {
+        path.display().to_string()
+    } else {
+        path.file_name()
+            .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+}
+
 /// Render the preview for `entry`, or `None` when nothing is selected.
 pub fn render(
     path: &Path,
@@ -50,7 +62,7 @@ pub fn render(
     let height = height.max(1);
     if is_dir {
         let mut p = Preview::default();
-        p.header = path.display().to_string();
+        p.header = header_for(path, true);
         p.rows.push(Line::from(TuiSpan::styled(
             "(directory)",
             Style::default().fg(Color::DarkGray),
@@ -68,10 +80,7 @@ pub fn render(
             let (head, line_truncated) = head_lines(&content, height);
             let spans = hl.highlight_with(head, syntax_for(path));
             let mut p = Preview::default();
-            p.header = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
+            p.header = header_for(path, false);
             'wrap: for line in spans {
                 for row in wrap_spans(&line, width) {
                     if p.rows.len() >= height {
@@ -96,10 +105,7 @@ pub fn render(
         None => {
             // Binary: file(1)-style info.
             let mut p = Preview::default();
-            p.header = path.file_name().map_or_else(
-                || path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
+            p.header = header_for(path, false);
             p.rows.push(Line::from(TuiSpan::styled(
                 binary_info(path, size),
                 Style::default().fg(Color::DarkGray),

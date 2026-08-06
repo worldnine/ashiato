@@ -91,6 +91,8 @@ ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまと
 
 - Rust + [ratatui](https://ratatui.rs) 0.30。ファイル収集は `ignore` クレート。
 - プレビューは先頭 256KB まで。バイナリは file(1) 的な情報表示でクラッシュしません。
+- 速度優先プレビュー: j/k 連打（キーリピート）中はプレースホルダ表示でカーソル
+  移動は一覧描画のみのコストに。キーを離すと ~40ms でプレビューが追いつきます。
 - light/dark は OSC 11 でターミナル背景色を問い合わせて自動判定（応答なしは dark）。
 - あえてやらないこと: ツリー表示・プレビュー内スクロール・ファジーマッチ・ABC ソート・アイコンフォント。詳細は [docs/spec.md](docs/spec.md)。
 
