@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Flat mtime-sorted file picker TUI: pick recent files, hand them to akapen."
 license = "MIT"
+repository = "https://github.com/worldnine/ashiato"
+keywords = ["tui", "file-picker", "mtime", "fzf", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
