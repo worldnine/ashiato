@@ -11,6 +11,12 @@ ashiato は「**時間ブラウザ**」であり、検索ツールではあり�
 ## インストール
 
 ```sh
+cargo install ashiato
+```
+
+ソースからビルドする場合:
+
+```sh
 cargo build --release
 # バイナリ: target/release/ashiato
 ```

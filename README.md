@@ -11,6 +11,12 @@ ashiato is a **time browser**, not a search tool: the default view is "what chan
 ## Install
 
 ```sh
+cargo install ashiato
+```
+
+Or from source:
+
+```sh
 cargo build --release
 # binary: target/release/ashiato
 ```
