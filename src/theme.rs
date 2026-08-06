@@ -1,13 +1,13 @@
 //! Terminal background auto-detection (OSC 11) and the light/dark UI
-//! color resolution shared with mdcomment.
+//! color resolution shared with akapen.
 //!
-//! revpick defaults to "auto": at startup it asks the terminal for its
+//! ashiato defaults to "auto": at startup it asks the terminal for its
 //! background color (`ESC ] 11 ; ?`), and the answer's perceived
 //! lightness picks the light/dark UI colors. `--light` / `--dark`
 //! override; terminals that don't answer (e.g. Terminal.app) fall back
-//! to dark. The detection half is manually MIRRORED in mdcomment's
+//! to dark. The detection half is manually MIRRORED in akapen's
 //! `src/theme.rs` — apply changes to both. The UI constants below are
-//! copied from mdcomment's `view.rs` (`selected_bg` / `border_color`)
+//! copied from akapen's `view.rs` (`selected_bg` / `border_color`)
 //! so both tools swap the same colors.
 
 use std::io::{IsTerminal, Write};
@@ -23,21 +23,21 @@ const OSC11_TIMEOUT: Duration = Duration::from_millis(150);
 /// The query: "report the background color" (OSC 11), ST-terminated.
 const OSC11_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
 
-/// Selection/cursor background: mdcomment's `selected_bg` constants
+/// Selection/cursor background: akapen's `selected_bg` constants
 /// (view.rs). Dark = neutral gray a step brighter than ANSI
 /// bright-black; light = pale cool gray.
 const SELECTED_BG_DARK: Color = Color::Rgb(88, 91, 112);
 const SELECTED_BG_LIGHT: Color = Color::Rgb(210, 210, 220);
-/// Outer border: mdcomment's `border_color` constants (view.rs).
+/// Outer border: akapen's `border_color` constants (view.rs).
 const BORDER_DARK: Color = Color::Rgb(127, 132, 156);
 const BORDER_LIGHT: Color = Color::Rgb(180, 180, 190);
 
-/// mdcomment's `selected_bg(light)` — same values, same semantics.
+/// akapen's `selected_bg(light)` — same values, same semantics.
 pub fn selected_bg(light: bool) -> Color {
     if light { SELECTED_BG_LIGHT } else { SELECTED_BG_DARK }
 }
 
-/// mdcomment's `border_color(light)`.
+/// akapen's `border_color(light)`.
 pub fn border_color(light: bool) -> Color {
     if light { BORDER_LIGHT } else { BORDER_DARK }
 }
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_colors_follow_mdcomment_constants() {
+    fn ui_colors_follow_akapen_constants() {
         assert_eq!(selected_bg(false), Color::Rgb(88, 91, 112));
         assert_eq!(selected_bg(true), Color::Rgb(210, 210, 220));
         assert_eq!(border_color(false), Color::Rgb(127, 132, 156));

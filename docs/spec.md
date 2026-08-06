@@ -1,6 +1,6 @@
-# revpick 仕様書
+# ashiato 仕様書
 
-**状態:** 設計確定・未実装
+**状態:** 実装済み（実装と同期して更新）
 
 ---
 
@@ -8,7 +8,7 @@
 
 プロジェクト全体のファイルを更新順（mtime 降順）でフラット表示する TUI ピッカー。
 ファイルを選んでパスを出力する（既定）。`--open-cmd` 指定時は選択ファイルを
-そのコマンドに渡す（mdcomment のレビューループ等）。
+そのコマンドに渡す（akapen のレビューループ等）。
 herdr 上でも単体でも使える。
 
 ---
@@ -16,7 +16,7 @@ herdr 上でも単体でも使える。
 ## 起動
 
 ```
-revpick [directory] [flags]
+ashiato [directory] [flags]
 ```
 
 ### フラグ
@@ -36,18 +36,13 @@ revpick [directory] [flags]
 | `--theme <name>` | —（`Catppuccin Mocha`） | プレビューの syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス。light 自動検出時は `Solarized (light)`） |
 | `--light` / `--dark` | 自動検出 | light/dark の明示指定。OSC 11 でターミナル背景色を問い合わせ、輝度 128 超で light。応答なしは dark |
 
-> **2026-08-06 改訂**: 未知のフラグ・値のないフラグ・不正な値（`--sort bogus`、
-> `--since bogus` 等）は**エラーで即終了**する。黙って無視すると typo が
-> 「効いたように見える」ため（例: `--outpu` で TUI が開いてしまう）。
->
-> **2026-08-05 改訂**: 旧仕様の既定値は `mdcomment` だったが、
-> 「revpick は汎用ピッカーであり、開くコマンドは外側（ラッパー）の責務」という
-> 疎結合の前提に合わせ、既定コマンドを廃止した。`--open-cmd mdcomment` を
-> 明示すれば旧仕様と同じ動作（起動 → ブロック → 再スキャン）になる。
+> 未知のフラグ・値のないフラグ・不正な値（`--sort bogus`、`--since bogus` 等）は
+> **エラーで即終了**する。黙って無視すると typo が「効いたように見える」ため
+> （例: `--outpu` で TUI が開いてしまう）。
 
 ### ディレクトリ解決の優先順位
 
-1. 引数で明示指定: `revpick /path/to/project`
+1. 引数で明示指定: `ashiato /path/to/project`
 2. herdr 環境変数から自動検出（`HERDR_ENV=1` の場合）:
    - `herdr worktree list` → 現在のワークスペースの worktree パスをルートに
    - なければ `herdr agent list` → 同じワークスペースのエージェントの `cwd` をルートに
@@ -72,8 +67,10 @@ __pycache__/
 
 ## UI レイアウト
 
+<!-- TODO: 実スクリーンショット画像に差し替える -->
+
 ```
-┌── revpick · /path/to/project · 23 files ──────────────────────────┐
+┌── ashiato · /path/to/project · 23 files ──────────────────────────┐
 │                                                                     │
 │  ── Today ─────────────────────────────────────────────────────── │
 │  > design.md                      14:23 │  1 // design.md          │
@@ -144,7 +141,7 @@ mtime を基準に時間帯でグループ化。空のクラスタは表示し�
 
 - `>` がカーソル行、`*` が Space 選択行（2026-08-05: 📄/📁 の絵文字は廃止。
   拡張子でファイル種別は十分判別可能なため、アイコン類は使わない）
-- カーソル行は **Cyan fg + グレー背景**（mdcomment の view モードと同一モデル）、
+- カーソル行は **Cyan fg + グレー背景**（akapen の view モードと同一モデル）、
   選択行はグレー背景のみ。グレー背景の色は light/dark で swap（`--light` 参照）
 - ファイル名の色はテーマのデフォルト前景色に追従（カーソル行は Cyan）
 - 行レイアウト: `<marker> <ディレクトリ部分><ベース名>  <日時>`
@@ -163,20 +160,20 @@ mtime を基準に時間帯でグループ化。空のクラスタは表示し�
 
 - 選択ファイルの先頭から、プレビュー領域に収まる行数だけ表示
 - **スクロール不可**（プレビュー内での j/k 移動はなし）
-- syntect によるシンタックスハイライト（mdcomment のコードを共用）
+- syntect によるシンタックスハイライト（akapen のコードを共用）
 - 画像・バイナリファイルは file(1) 的な情報を表示（例: `PNG image data, 640x480, 24KB`）
 
 ### テーマ
 
 - `--theme <name>`: two-face の埋め込みテーマ名（例: `Catppuccin Mocha`）または
-  `.tmTheme` ファイルパス（mdcomment と同じ引数）
+  `.tmTheme` ファイルパス（akapen と同じ引数）
 - light/dark は**自動判定**: 起動時 OSC 11（`ESC ] 11 ; ?`）でターミナル背景色を
   問い合わせ、輝度が 128 を超えれば light。応答しないターミナル（Terminal.app 等）は
   dark。`--light` / `--dark` で明示指定が最優先
 - `--theme` 未指定時: light なら `Solarized (light)`、dark なら `Catppuccin Mocha`
-- TUI 色（選択行背景・外枠ボーダー）は mdcomment の `--light` と同一の定数で swap。
+- TUI 色（選択行背景・外枠ボーダー）は akapen の `--light` と同一の定数で swap。
   ファイル名はテーマのデフォルト前景色で描画（light テーマでは暗色になる）。
-  カーソル行のみ Cyan アクセント（mdcomment の view モードと同じモデル）
+  カーソル行のみ Cyan アクセント（akapen の view モードと同じモデル）
 - 将来的に設定ファイルが入ればそこで指定
 
 ### 表示制御（`--preview <on|off|auto>`）
@@ -253,12 +250,12 @@ mtime を基準に時間帯でグループ化。空のクラスタは表示し�
 
 ```
 1. Space でファイルを選択（複数可）
-2. Enter → revpick は子プロセスとして --open-cmd を起動
-   例: mdcomment /path/a.md /path/b.rs /path/c.toml
-3. revpick は子プロセスの終了を待つ（ブロック）
+2. Enter → ashiato は子プロセスとして --open-cmd を起動
+   例: akapen /path/a.md /path/b.rs /path/c.toml
+3. ashiato は子プロセスの終了を待つ（ブロック）
 4. 子プロセス終了 → ファイル一覧を再スキャン
    → エージェントが編集したファイルの mtime が更新され上に来る
-5. revpick の TUI に復帰
+5. ashiato の TUI に復帰
 ```
 
 `--open-cmd` 未指定時はこのフロー自体がなく、Enter は出力モード（下記）。
@@ -267,26 +264,26 @@ mtime を基準に時間帯でグループ化。空のクラスタは表示し�
 
 ## `--files` モード（時間ブラウザのデータソース）
 
-TUI を開かずに「時間順に並んだファイル一覧」を出力する。revpick の
+TUI を開かずに「時間順に並んだファイル一覧」を出力する。ashiato の
 収集ロジック（herdr 解決・gitignore・常時除外・隠し/ディレクトリ切替・
 ソート・フィルタ）がそのままデータソースになる。
 
 ```bash
-revpick --files | fzf                                # 時間順 × ファジー検索
-revpick --files --format tsv | fzf --delimiter $'\t' --with-nth 1..2 \
+ashiato --files | fzf                                # 時間順 × ファジー検索
+ashiato --files --format tsv | fzf --delimiter $'\t' --with-nth 1..2 \
   --preview 'bat --color=always {3}'                 # 時間列 + 名前表示、プレビューはフルパス
-revpick --files --format tsv | fzf --delimiter $'\t' --with-nth 2 --nth 2.. \
+ashiato --files --format tsv | fzf --delimiter $'\t' --with-nth 2 --nth 2.. \
   --preview 'bat --color=always {3}'                 # ファイル名だけ表示（検索は名前+パス）
-revpick --since today --filter .md                   # TUI: 今日の md をプレビュー付きでブラウズ
-revpick --files --since today | fzf                  # 今日触ったファイルだけ
-revpick --files --since 1w --filter .md | xargs mdcomment  # 今週の md をまとめてレビュー
-revpick --files | fzf --bind 'ctrl-r:reload(revpick --files)'  # ライブ更新（手動）
+ashiato --since today --filter .md                   # TUI: 今日の md をプレビュー付きでブラウズ
+ashiato --files --since today | fzf                  # 今日触ったファイルだけ
+ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまとめてレビュー
+ashiato --files | fzf --bind 'ctrl-r:reload(ashiato --files)'  # ライブ更新（手動）
 ```
 
-位置づけ: revpick は「**時間ブラウザ**」（直近の変更がデフォルトビュー）であり、
+位置づけ: ashiato は「**時間ブラウザ**」（直近の変更がデフォルトビュー）であり、
 検索ツールではない。ファジー検索・高度なプレビューが必要な場合は
-`--files` で fzf に委ねる（相互運用）。mdcomment レビューループ
-（ブロック → 再スキャン → 状態維持）は revpick 単体の領分。
+`--files` で fzf に委ねる（相互運用）。akapen レビューループ
+（ブロック → 再スキャン → 状態維持）は ashiato 単体の領分。
 
 ## 既定動作（出力モード・UNIX フィルタ）
 
@@ -294,21 +291,21 @@ revpick --files | fzf --bind 'ctrl-r:reload(revpick --files)'  # ライブ更新
 `--output` はこの既定動作の明示指定（`--open-cmd` と併用不可）。
 
 ```
-$ revpick .
+$ ashiato .
 # TUI が開き、Space で選択 → Enter で選択ファイルパスが stdout に出力されて終了
 /path/to/design.md
 /path/to/src/main.rs
 
-$ revpick . --show-hidden
+$ ashiato . --show-hidden
 # 隠しファイルも表示
 ```
 
 パイプでの利用:
 
 ```bash
-revpick . | xargs mdcomment
-revpick . | xargs vim -p
-revpick --sort ctime | while read f; do echo "==> $f"; cat "$f"; done
+ashiato . | xargs akapen
+ashiato . | xargs vim -p
+ashiato --sort ctime | while read f; do echo "==> $f"; cat "$f"; done
 ```
 
 stdout がパイプの場合、TUI は `/dev/tty` に描画されるため
@@ -320,7 +317,7 @@ stdout がパイプの場合、TUI は `/dev/tty` に描画されるため
 
 ### herdr 上の自動ディレクトリ解決
 
-revpick は `HERDR_ENV=1` の場合、起動時に以下を試行:
+ashiato は `HERDR_ENV=1` の場合、起動時に以下を試行:
 
 ```bash
 # 1. worktree のパスを取得
@@ -338,30 +335,30 @@ herdr agent list 2>/dev/null
 # ~/.config/yazi/keymap.toml
 [[manager.prepend_keymap]]
 on   = [ "g", "f" ]
-run  = "shell 'revpick . --open-cmd mdcomment' --block"
-desc = "Flat mtime picker → mdcomment"
+run  = "shell 'ashiato . --open-cmd akapen' --block"
+desc = "Flat mtime picker → akapen"
 ```
 
-### herdr ラッパーでの mdcomment 連携
+### herdr ラッパーでの akapen 連携
 
 ```bash
 #!/bin/bash
-# herdr ラッパーが revpick + mdcomment を繋ぐ例。
-# mdcomment の `--send-agent` が「現在タブの唯一のエージェント」を自動解決して
+# herdr ラッパーが ashiato + akapen を繋ぐ例。
+# akapen の `--send-agent` が「現在タブの唯一のエージェント」を自動解決して
 # `herdr agent prompt <pane> <text>` で送信する（argv 直接渡し、シェル非経由）。
 # 0件・複数で曖昧なら赤トーストで拒否し、コメントは保持される。
 
-revpick . --open-cmd "mdcomment {} --send-agent"
+ashiato . --open-cmd "akapen {} --send-agent"
 ```
 
 > **2026-08-05 決定**: 当初案の `--send-cmd 'herdr pane run ...'` 方式は、
 > `herdr pane run` がコマンド引数必須で stdin を読まない（usage エラーになる）ため
-> 不採用。mdcomment 側に `--send-agent`（タブ内唯一エージェントへ自動送信、
+> 不採用。akapen 側に `--send-agent`（タブ内唯一エージェントへ自動送信、
 > herdr agent prompt 経由）を実装し、ラッパーは引数を渡すだけで済むようにした。
 > 実機確認済み（2026-08-05: 使い捨てタブのテスト agent に reviewr 形式ブロックが
 > 届き ack 応答）。
 
-revpick 自身は herdr 非依存。連携は外側のラッパー（または yazi の opener 設定）の責務。
+ashiato 自身は herdr 非依存。連携は外側のラッパー（または yazi の opener 設定）の責務。
 
 ---
 
@@ -373,8 +370,8 @@ revpick 自身は herdr 非依存。連携は外側のラッパー（または y
 | `{1}` `{2}` ... | 1番目、2番目...のファイルパス |
 
 ```bash
-revpick . --open-cmd "mdcomment --theme Nord {}"
-revpick . --open-cmd "vim -p {}"
+ashiato . --open-cmd "akapen --theme Nord {}"
+ashiato . --open-cmd "vim -p {}"
 ```
 
 ---
@@ -383,27 +380,27 @@ revpick . --open-cmd "vim -p {}"
 
 ### 技術スタック
 
-- Rust + ratatui 0.30（mdcomment と共通）
+- Rust + ratatui 0.30（akapen と共通）
 - crates: `anyhow`, `ratatui`, `syntect`, `ignore`, `unicode-width`, `chrono`
-- mdcomment と同じリポジトリ内、別バイナリ（`src/bin/revpick.rs` またはワークスペースメンバー）
+- standalone リポジトリ。akapen とは `--open-cmd` に渡すコマンド名の文字列だけで繋がる疎結合
 
 ### ファイル構成
 
 ```
-Cargo.toml           → workspace 化（mdcomment + revpick をメンバーに）
-src/
-  main.rs            → mdcomment エントリ
-  ...
-src/bin/
-  revpick.rs         → revpick エントリ（または revpick/ ディレクトリ）
+src/main.rs      — エントリ、フラグ解析、App 状態、イベントループ、描画、キーバインド
+src/files.rs     — ignore クレートでの収集、ソート、時間クラスタ、フィルタ
+src/preview.rs   — 右ペイン: syntect ハイライト / バイナリは file(1) 的表示
+src/theme.rs     — OSC 11 背景色検出 + light/dark UI 色（akapen と同一定数）
+src/highlight.rs — akapen の highlight.rs の手動コピー
+src/herdr.rs     — herdr ディレクトリ解決（JSON パース）
+src/clipboard.rs — pbcopy / wl-copy / xclip / xsel
 ```
 
-（standalone の revpick では `src/main.rs` + `src/theme.rs` 構成。`theme.rs` は
-OSC 11 背景色検出と light/dark UI 色の解決で、mdcomment `view.rs` の定数をコピー）
+### プレビューの syntect（akapen とのコード共有）
 
-### プレビューの syntect 共用
-
-mdcomment の `src/highlight.rs` を共通クレートとして切り出し、両バイナリから利用する。
+`src/highlight.rs` は akapen からの**手動コピー**。ズレても「プレビューの色が
+少し違う」だけで壊れないため許容する。このコピーへの変更要求が3回目になったら、
+そのとき highlight だけを小さな共通クレートへ切り出す（YAGNI。それまではやらない）。
 
 ### ファイル収集
 
@@ -427,14 +424,14 @@ builder.filter_entry(|e| {
 
 | 項目 | 理由 |
 |---|---|
-| ツリー表示 | yazi / broot の領分。revpick はフラット mtime 専用 |
-| プレビュー内スクロール | revpick はピッカー。深いプレビューは mdcomment でやる |
-| `.md` のレンダリングプレビュー | syntect ハイライトで十分。レンダリングは mdcomment の view モードで |
-| git ステータス表示（`M`/`A`/`?`） | 後回し。mdcomment の git 連携と同時期に検討 |
+| ツリー表示 | yazi / broot の領分。ashiato はフラット mtime 専用 |
+| プレビュー内スクロール | ashiato はピッカー。深いプレビューは akapen でやる |
+| `.md` のレンダリングプレビュー | syntect ハイライトで十分。レンダリングは akapen の view モードで |
+| git ステータス表示（`M`/`A`/`?`） | 後回し。akapen の git 連携と同時期に検討 |
 | `d` で `git diff` 表示 | 同上 |
 | 設定ファイル | 設定項目が少ない。使ってから必要になったら追加 |
 | Nerd Font アイコン・絵文字 | フォント依存・見た目。拡張子で十分（📄 等の絵文字も 2026-08-05 に廃止） |
-| ABC ソート | 普通のファイラでやればいい。revpick は時系列専用 |
+| ABC ソート | 普通のファイラでやればいい。ashiato は時系列専用 |
 | キーバインドのカスタマイズ | キーが少なく vim 準拠。カスタマイズ需要は低い |
 
 ---
@@ -446,8 +443,8 @@ builder.filter_entry(|e| {
 3. クラスタリング → Today / Yesterday / ... が正しく区切られる
 4. `t` → ソート巡回が正しく動作
 5. `/` → フィルタがインクリメンタルに動作
-6. `Space` → 複数選択 → Enter → mdcomment にファイルが渡される
-7. mdcomment 終了後 → ファイル一覧が再スキャンされ最新状態に
+6. `Space` → 複数選択 → Enter → akapen にファイルが渡される
+7. akapen 終了後 → ファイル一覧が再スキャンされ最新状態に
 8. `y` → クリップボードにフルパスが入る
 9. `Ctrl+h` → 隠しファイル表示/非表示
 10. `d` → ディレクトリ表示/非表示
@@ -458,5 +455,5 @@ builder.filter_entry(|e| {
 15. herdr 外でも `herdr` コマンド不在でクラッシュせず起動する
 16. OSC 11 応答のパース（`rgb:rrrr/gggg/bbbb` / 短形式 / `rgba:` / `#rrggbb`）が正しい
 17. `--light` / `--dark` がパースされ、既定が自動検出（None）になる
-18. light/dark の UI 色が mdcomment と同一の定数で解決される
+18. light/dark の UI 色が akapen と同一の定数で解決される
 19. 行レイアウトの短縮: ベース名が最優先（ディレクトリ → `…/` 短縮 → ベース名 `…` 短縮）、文字境界安全

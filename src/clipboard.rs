@@ -1,4 +1,4 @@
-//! Clipboard support (ported from mdcomment's `export.rs`, MIT reviewr).
+//! Clipboard support (ported from akapen's `export.rs`, MIT reviewr).
 //!
 //! `y` copies the selected files' full paths: pipe into the first
 //! available tool — `pbcopy` (macOS), `wl-copy` (Wayland), `xclip`/`xsel`
@@ -56,6 +56,6 @@ mod tests {
     #[test]
     fn which_finds_real_binaries_and_rejects_fakes() {
         assert!(which("sh"), "sh exists on every Unix PATH");
-        assert!(!which("definitely-not-a-real-tool-revpick-xyz"));
+        assert!(!which("definitely-not-a-real-tool-ashiato-xyz"));
     }
 }

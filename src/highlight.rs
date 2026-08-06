@@ -1,8 +1,9 @@
-//! NOTE: this file is a manual COPY from mdcomment
-//! Sync source: /Users/nagata/src/tries/2026-08-01-mdcomment-hermes/src/highlight.rs
-//! (see README "配置方針" — revpick stays standalone by design)
+//! NOTE: this file is a manual COPY of akapen's `src/highlight.rs`
+//! (ashiato stays standalone by design; drift only means slightly
+//! different preview colors). If this copy needs a change for the
+//! third time, extract a small shared crate instead — not before.
 //! Syntax highlighting via `syntect`, ported from herdr-reviewr's
-//! `highlight.rs` (MIT, Dmitry Persiyanov) and simplified: mdcomment always
+//! `highlight.rs` (MIT, Dmitry Persiyanov) and simplified: akapen always
 //! highlights markdown, uses syntect's bundled defaults instead of two-face,
 //! and renders directly to ratatui `Style`s.
 //!
@@ -185,8 +186,8 @@ impl Highlighter {
     }
 
     /// The parsed syntect theme (for serializing the code-highlighting
-    /// theme and resolving scope styles). Unused by revpick; kept for
-    /// mdcomment (shared module).
+    /// theme and resolving scope styles). Unused by ashiato; kept for
+    /// akapen (shared module).
     #[allow(dead_code)]
     pub fn theme(&self) -> &syntect::highlighting::Theme {
         &self.theme
@@ -195,7 +196,7 @@ impl Highlighter {
     /// Resolve a single scope (e.g. `markup.heading.2.markdown`) against
     /// the theme exactly as syntect would: the best-matching rule wins, and
     /// rules apply in ascending specificity order. `None` when the theme
-    /// has no rule touching `scope`. Unused by revpick; kept for mdcomment
+    /// has no rule touching `scope`. Unused by ashiato; kept for akapen
     /// (shared module).
     #[allow(dead_code)]
     pub fn scope_style(&self, scope: &str) -> Option<Style> {
@@ -508,7 +509,7 @@ mod tests {
     #[test]
     fn theme_loads_from_tmtheme_file_path() {
         // A `--theme /path/to/theme.tmTheme` must load the file directly.
-        let dir = std::env::temp_dir().join(format!("mdcomment-theme-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("akapen-theme-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("minimal.tmTheme");
         std::fs::write(&path, MINIMAL_TM_THEME).unwrap();
@@ -554,7 +555,7 @@ mod tests {
         // syntect's GFM grammar emits `markup.raw.code-fence.markdown`;
         // a theme defining only the legacy name must still color the
         // fenced code (the alias duplicates the rule onto the new scope).
-        let dir = std::env::temp_dir().join(format!("mdcomment-alias-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("akapen-alias-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.tmTheme");
         std::fs::write(&path, LEGACY_TM_THEME).unwrap();

@@ -1,20 +1,20 @@
-//! revpick — flat mtime-sorted file picker TUI (spec: revpick-spec.md).
+//! ashiato — flat mtime-sorted file picker TUI (spec: ashiato-spec.md).
 //!
 //! Lists every file under a project root, newest first, clustered into
 //! Today / Yesterday / This week / Last week / This month / Older.
 //! Space multi-selects, Enter hands the files to `--open-cmd` (default
-//! `mdcomment`), blocks until it exits, then rescans. `/` filters
+//! `akapen`), blocks until it exits, then rescans. `/` filters
 //! incrementally, `t` cycles the sort, Ctrl+h toggles hidden dirs, `d`
 //! toggles directories, `y` copies paths. Without `--open-cmd`, Enter
 //! prints the selected paths to stdout and exits (generic picker, fzf
 //! model); with it, Enter launches the command, blocks, and rescans
-//! (the mdcomment review-loop flow).
+//! (the akapen review-loop flow).
 //!
 //! The root resolves from: the positional argument → herdr (`HERDR_ENV=1`
 //! → `herdr worktree list` → `herdr agent list`) → the current directory.
 //!
-//! This prototype shares mdcomment's `highlight` module (syntect) so it
-//! can later move into the mdcomment repo as `src/bin/revpick.rs`.
+//! This prototype shares akapen's `highlight` module (syntect) so it
+//! can later move into the akapen repo as `src/bin/ashiato.rs`.
 
 mod clipboard;
 mod files;
@@ -56,7 +56,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_THEME_LIGHT: &str = "Solarized (light)";
 /// Event poll/tick cadence, ms.
 const TICK_MS: u64 = 100;
-/// Events processed per frame at most (mdcomment's anti-freeze pattern:
+/// Events processed per frame at most (akapen's anti-freeze pattern:
 /// a burst is drained once and drawn once).
 const MAX_EVENTS_PER_FRAME: usize = 64;
 /// Transient footer messages live this long.
@@ -329,9 +329,9 @@ fn main() -> Result<()> {
     match Config::from_env()? {
         Action::Help => {
             print_line(
-                "revpick — flat mtime-sorted file picker\n\
+                "ashiato — flat mtime-sorted file picker\n\
                  \n\
-                 usage: revpick [directory] [flags]\n\
+                 usage: ashiato [directory] [flags]\n\
                  \n\
                  \x20 directory     project root (default: herdr workspace → cwd)\n\
                  \x20 --sort <mtime|ctime>  initial sort basis (default mtime)\n\
@@ -371,7 +371,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Action::Version => {
-            print_line(&format!("revpick {VERSION}"))?;
+            print_line(&format!("ashiato {VERSION}"))?;
             Ok(())
         }
         Action::Run(config) => run(config),
@@ -408,7 +408,7 @@ struct App {
     /// `:nohlsearch` model).
     filter_on: bool,
     /// `--since` cutoff (startup time filter; also applies to the TUI so
-    /// `revpick --since 1d` browses today's files with the preview).
+    /// `ashiato --since 1d` browses today's files with the preview).
     since: Option<Since>,
     /// True while the filter input line is open.
     filter_active: bool,
@@ -416,9 +416,9 @@ struct App {
     sort: Sort,
     show_hidden: bool,
     show_dirs: bool,
-    /// syntect highlighter shared with mdcomment (two-face themes).
+    /// syntect highlighter shared with akapen (two-face themes).
     highlight: Highlighter,
-    /// Resolved UI colors for the current light/dark mode (mdcomment's
+    /// Resolved UI colors for the current light/dark mode (akapen's
     /// `--light` pattern: the same constants, resolved once at startup).
     ui_selected_bg: Color,
     ui_border: Color,
@@ -551,7 +551,7 @@ impl App {
     }
 
     /// Periodic silent refresh: re-scan and commit only when the listing
-    /// actually changed (an agent editing files while revpick is open
+    /// actually changed (an agent editing files while ashiato is open
     /// floats the touched files up on its own — the preview cache and
     /// cursor/selection survive when nothing changed).
     fn refresh_if_changed(&mut self) {
@@ -673,7 +673,7 @@ fn clamp_to_file(visible: &[Row], mut row: usize) -> usize {
 }
 
 /// Print one line to stdout, treating a closed pipe as a silent stop
-/// (the consumer quit early — e.g. `revpick --files | fzf` when fzf
+/// (the consumer quit early — e.g. `ashiato --files | fzf` when fzf
 /// exits first). Rust's `println!` panics on EPIPE, which would dump a
 /// stack trace into the user's terminal.
 fn print_line(line: &str) -> Result<()> {
@@ -689,7 +689,7 @@ fn print_line(line: &str) -> Result<()> {
 /// `--files` mode: scan, filter (--filter / --since), print, exit.
 /// The listing is the same one the TUI shows — herdr resolution,
 /// gitignore, always-on ignores, hidden/dirs toggles, sort — but as
-/// plain lines for `revpick --files | fzf` and friends.
+/// plain lines for `ashiato --files | fzf` and friends.
 fn run_files(config: &Config) -> Result<()> {
     let root = resolve_root(config.dir.as_deref())?;
     let mut entries = files::scan(&root, config.show_hidden, config.show_dirs)?;
@@ -775,7 +775,7 @@ type Term = Terminal<CrosstermBackend<Box<dyn std::io::Write>>>;
 
 /// Build the terminal. When stdout is piped, the TUI renders on the
 /// controlling terminal (/dev/tty) so the pipe carries only the selected
-/// paths (`revpick . | xargs mdcomment` — the generic picker use).
+/// paths (`ashiato . | xargs akapen` — the generic picker use).
 /// Without a tty available the stdout writer is kept as a fallback.
 fn make_terminal() -> Result<Term> {
     use std::io::IsTerminal;
@@ -797,7 +797,7 @@ fn make_terminal() -> Result<Term> {
 /// can initialize. On macOS this must be the actual pty slave: /dev/tty
 /// is a synthetic node that kqueue (mio) rejects with EINVAL, and
 /// crossterm's own /dev/tty fallback therefore fails with "Failed to
-/// initialize input reader" (`revpick --files | xargs mdcomment` dies).
+/// initialize input reader" (`ashiato --files | xargs akapen` dies).
 fn ensure_terminal_stdin() {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
@@ -1157,7 +1157,7 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
         return;
     }
     let cmd = expand_cmd(app.config.open_cmd.as_deref().expect("checked above"), &paths);
-    // Suspend the TUI while the child owns the terminal (mdcomment's
+    // Suspend the TUI while the child owns the terminal (akapen's
     // editor pattern): leave the alternate screen and raw mode.
     if let Some(t) = terminal.as_deref_mut() {
         let _ = execute!(t.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
@@ -1331,7 +1331,7 @@ fn scroll_view(app: &mut App, delta: isize, list_h: usize) {
 fn draw(f: &mut Frame, app: &mut App) {
     let now = chrono::Local::now();
     let title = format!(
-        "revpick · {} · {} files",
+        "ashiato · {} · {} files",
         app.root.display(),
         app.visible_count()
     );
@@ -1495,7 +1495,7 @@ fn separator_line(label: &str, width: usize) -> Line<'static> {
 /// context, so the name always wins). No icon (2026-08-05: the 📄/📁
 /// emoji was dropped — extension-based reading is enough, per the
 /// spec's no-icon stance). Cursor and Space-selected rows get the
-/// mdcomment gray background (spec).
+/// akapen gray background (spec).
 fn file_line(
     app: &App,
     idx: usize,
@@ -1505,8 +1505,8 @@ fn file_line(
 ) -> Line<'static> {
     let e = &app.files[idx];
     let sel = app.selected.contains(&idx);
-    // Cursor/selection: background change only, on the mdcomment gray.
-    // Only the cursor row's *name* gets a Cyan accent (mdcomment's view
+    // Cursor/selection: background change only, on the akapen gray.
+    // Only the cursor row's *name* gets a Cyan accent (akapen's view
     // mode); the datetime stays gray — the time is secondary.
     let base = if is_cursor || sel {
         Style::default().bg(app.ui_selected_bg)
@@ -1637,8 +1637,8 @@ mod tests {
     fn expand_cmd_substitutes_all_and_indexed_placeholders() {
         let paths = vec![p("/a/one.md"), p("/b/two.md")];
         assert_eq!(
-            expand_cmd("mdcomment --theme Nord {}", &paths),
-            "mdcomment --theme Nord '/a/one.md' '/b/two.md'"
+            expand_cmd("akapen --theme Nord {}", &paths),
+            "akapen --theme Nord '/a/one.md' '/b/two.md'"
         );
         assert_eq!(
             expand_cmd("vim -p {1} {2}", &paths),
@@ -1650,7 +1650,7 @@ mod tests {
             "x {3} '/a/one.md' '/b/two.md'"
         );
         // No placeholder → paths appended.
-        assert_eq!(expand_cmd("mdcomment", &paths), "mdcomment '/a/one.md' '/b/two.md'");
+        assert_eq!(expand_cmd("akapen", &paths), "akapen '/a/one.md' '/b/two.md'");
         // Non-numeric braces stay literal (and don't count as substituted).
         assert_eq!(
             expand_cmd("awk '{print}'", &paths),
@@ -1669,8 +1669,8 @@ mod tests {
             "vim '/a/x{2}.md' '/b/two.md'"
         );
         let paths = vec![p("/a/x{}.md")];
-        assert_eq!(expand_cmd("mdcomment {}", &paths), "mdcomment '/a/x{}.md'");
-        assert_eq!(expand_cmd("mdcomment {1}", &paths), "mdcomment '/a/x{}.md'");
+        assert_eq!(expand_cmd("akapen {}", &paths), "akapen '/a/x{}.md'");
+        assert_eq!(expand_cmd("akapen {1}", &paths), "akapen '/a/x{}.md'");
     }
 
     #[test]

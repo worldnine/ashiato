@@ -1,6 +1,6 @@
-//! Preview pane: syntect-highlighted file head (mdcomment's highlighter),
+//! Preview pane: syntect-highlighted file head (akapen's highlighter),
 //! or file(1)-style info for binary/image files. Not scrollable (spec:
-//! revpick is a picker — deep previews belong to mdcomment).
+//! ashiato is a picker — deep previews belong to akapen).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,7 +27,7 @@ pub struct Preview {
 }
 
 /// Cache key: the preview is re-rendered only when the file, its size or
-/// mtime, or the pane geometry changes (e.g. after mdcomment edited it).
+/// mtime, or the pane geometry changes (e.g. after akapen edited it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviewKey {
     pub path: PathBuf,
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn missing_file_renders_binary_placeholder() {
         let hl = Highlighter::new(None, false);
-        let prev = render(Path::new("/nonexistent/revpick-xyz"), 0, false, 40, 20, &hl);
+        let prev = render(Path::new("/nonexistent/ashiato-xyz"), 0, false, 40, 20, &hl);
         assert_eq!(prev.rows.len(), 1); // file(1)-style line, no panic
     }
 }

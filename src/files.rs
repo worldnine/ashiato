@@ -1,7 +1,7 @@
 //! File collection, sorting, time clustering, and filtering.
 //!
 //! The scan walks the root with the `ignore` crate (respecting `.gitignore`
-//! and `.ignore` files), then applies revpick's own always-on ignores and
+//! and `.ignore` files), then applies ashiato's own always-on ignores and
 //! the hidden/dirs display filters. Sort order and time clusters are pure
 //! functions so they are unit-testable with a controlled "now".
 
@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn scan_missing_root_errors() {
-        assert!(scan(Path::new("/nonexistent/revpick-test"), true, false).is_err());
+        assert!(scan(Path::new("/nonexistent/ashiato-test"), true, false).is_err());
     }
 
     #[test]

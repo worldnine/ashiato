@@ -1,8 +1,8 @@
 [package]
-name = "revpick"
+name = "ashiato"
 version = "0.1.0"
 edition = "2024"
-description = "Flat mtime-sorted file picker TUI: pick recent files, hand them to mdcomment."
+description = "Flat mtime-sorted file picker TUI: pick recent files, hand them to akapen."
 license = "MIT"
 
 [dependencies]

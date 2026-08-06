@@ -5,7 +5,7 @@
 //! 2. `herdr agent list` → the first agent whose `workspace_id` equals
 //!    `HERDR_WORKSPACE_ID`, using its `cwd`
 //!
-//! revpick itself stays herdr-independent: `herdr` missing from PATH (or
+//! ashiato itself stays herdr-independent: `herdr` missing from PATH (or
 //! any command failing, or hanging past [`HERDR_TIMEOUT`]) yields `None`
 //! and the caller falls back to the current directory — never a crash or
 //! a stuck startup (spec test 15).
@@ -186,7 +186,7 @@ mod tests {
                 { "agent": "claude", "pane_id": "wY:p1K", "tab_id": "wY:tV",
                   "workspace_id": "wY", "cwd": "/hermes" },
                 { "agent": "pi", "pane_id": "wY:p21", "tab_id": "wY:tY",
-                  "workspace_id": "wY", "cwd": "/revpick" }
+                  "workspace_id": "wY", "cwd": "/ashiato" }
             ] }
         });
         assert_eq!(
@@ -208,7 +208,7 @@ mod tests {
         let v = json!({
             "result": { "agents": [
                 { "agent": "hermes", "pane_id": "wY:p1W", "tab_id": "wY:tX",
-                  "workspace_id": "wY", "cwd": "/Users/nagata/src/tries" },
+                  "workspace_id": "wY", "cwd": "/home/user/src" },
                 { "agent": "claude", "pane_id": "wY:p1K", "tab_id": "wY:tV",
                   "workspace_id": "wY", "cwd": "/hermes" }
             ] }
