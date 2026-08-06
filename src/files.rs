@@ -101,68 +101,56 @@ pub fn sort_entries(entries: &mut [FileEntry], sort: Sort) {
     });
 }
 
-/// The time clusters, oldest to newest, each with its spec label.
+/// The time clusters, newest first: Today / Yesterday, then **one header
+/// per day**. Older days are never lumped into week/month buckets — the
+/// date is the foundation you need when you come back to a file days
+/// later (spec: `Wed, Aug 4` style headers).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cluster {
-    Older,
-    ThisMonth,
-    LastWeek,
-    ThisWeek,
-    Yesterday,
     Today,
+    Yesterday,
+    /// A day before yesterday; the header shows its date.
+    Date(NaiveDate),
 }
 
 impl Cluster {
-    pub fn label(self) -> &'static str {
+    /// Header label: `Today` / `Yesterday` keep their names; older days
+    /// show the date (e.g. `Wed, Aug 4`), with the year appended when it
+    /// differs from `now`'s year (`Wed, Dec 3, 2025`) so a scan that
+    /// crosses years stays unambiguous.
+    pub fn label(self, now: chrono::DateTime<Local>) -> String {
         match self {
-            Cluster::Older => "Older",
-            Cluster::ThisMonth => "This month",
-            Cluster::LastWeek => "Last week",
-            Cluster::ThisWeek => "This week",
-            Cluster::Yesterday => "Yesterday",
-            Cluster::Today => "Today",
+            Cluster::Today => "Today".to_string(),
+            Cluster::Yesterday => "Yesterday".to_string(),
+            Cluster::Date(d) => {
+                if d.year() == now.year() {
+                    d.format("%a, %b %-d").to_string()
+                } else {
+                    d.format("%a, %b %-d, %Y").to_string()
+                }
+            }
         }
     }
 }
 
-/// Which cluster `t` (a local datetime) belongs to, with cluster boundaries
+/// Which cluster `t` (a local datetime) belongs to, with boundaries
 /// computed from `now`:
 ///
-/// | label      | condition                                      |
-/// |------------|------------------------------------------------|
-/// | Today      | today 00:00 onward                              |
-/// | Yesterday  | yesterday 00:00 .. today 00:00                  |
-/// | This week  | this Monday 00:00 .. yesterday 00:00            |
-/// | Last week  | last Monday 00:00 .. this Monday 00:00          |
-/// | This month | 1st of month 00:00 .. last Monday 00:00         |
-/// | Older      | before that                                     |
+/// | label        | condition                                   |
+/// |--------------|---------------------------------------------|
+/// | Today        | today 00:00 onward                          |
+/// | Yesterday    | yesterday 00:00 .. today 00:00              |
+/// | Wed, Aug 4 … | every earlier day gets its own date header  |
 pub fn cluster_of(t: chrono::DateTime<Local>, now: chrono::DateTime<Local>) -> Cluster {
     let d = t.date_naive();
     let today = now.date_naive();
-    let yesterday = today - chrono::Duration::days(1);
-    let this_monday = monday_of(today);
-    let last_monday = this_monday - chrono::Duration::days(7);
-    let month_first = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-        .expect("month 1 always exists");
     if d >= today {
         Cluster::Today
-    } else if d >= yesterday {
+    } else if d == today - chrono::Duration::days(1) {
         Cluster::Yesterday
-    } else if d >= this_monday {
-        Cluster::ThisWeek
-    } else if d >= last_monday {
-        Cluster::LastWeek
-    } else if d >= month_first {
-        Cluster::ThisMonth
     } else {
-        Cluster::Older
+        Cluster::Date(d)
     }
-}
-
-/// The Monday (00:00) of `d`'s week.
-fn monday_of(d: NaiveDate) -> NaiveDate {
-    let since_monday = d.weekday().num_days_from_monday() as i64;
-    d - chrono::Duration::days(since_monday)
 }
 
 /// Convert a `SystemTime` to local time for clustering/formatting.
@@ -170,23 +158,11 @@ pub fn to_local(t: SystemTime) -> chrono::DateTime<Local> {
     t.into()
 }
 
-/// Spec date display:
-///
-/// | elapsed      | format     | example  |
-/// |--------------|------------|----------|
-/// | today        | `HH:MM`    | `14:23`  |
-/// | this year    | `Mon D`    | `Aug 3`  |
-/// | before       | `YYYY-MM-DD` | `2025-12-03` |
-pub fn format_time(t: chrono::DateTime<Local>, now: chrono::DateTime<Local>) -> String {
-    let d = t.date_naive();
-    let today = now.date_naive();
-    if d == today {
-        format!("{:02}:{:02}", t.hour(), t.minute())
-    } else if d.year() == today.year() {
-        format!("{} {}", t.format("%b"), t.day())
-    } else {
-        t.format("%Y-%m-%d").to_string()
-    }
+/// Spec date display: **every row shows the time of day** (`HH:MM`). The
+/// cluster headers carry the date context (`── Wed, Aug 4 ──`), so older
+/// files no longer need `Mon D` / `YYYY-MM-DD` on the row itself.
+pub fn format_time(t: chrono::DateTime<Local>) -> String {
+    format!("{:02}:{:02}", t.hour(), t.minute())
 }
 
 /// Case-insensitive substring match on the relative path. A leading `/` in
@@ -345,42 +321,47 @@ mod tests {
     }
 
     #[test]
-    fn cluster_boundaries_follow_the_spec_table() {
-        let n = now(); // Wed 2026-08-05: this Mon Aug 3, last Mon Jul 27, month 1st Aug 1
+    fn cluster_is_per_day() {
+        let n = now(); // Wed 2026-08-05
         assert_eq!(cluster_of(local(2026, 8, 5, 0, 1), n), Cluster::Today);
         assert_eq!(cluster_of(local(2026, 8, 4, 23, 59), n), Cluster::Yesterday);
-        // This week = this Monday 00:00 .. yesterday 00:00 (Aug 3-4).
-        assert_eq!(cluster_of(local(2026, 8, 3, 0, 0), n), Cluster::ThisWeek);
-        // Last week = last Monday (Jul 27) .. this Monday (Aug 3).
-        assert_eq!(cluster_of(local(2026, 8, 2, 23, 59), n), Cluster::LastWeek);
-        assert_eq!(cluster_of(local(2026, 7, 27, 0, 0), n), Cluster::LastWeek);
-        // Jul 27..Jul 31 are all within last week (>= Jul 27).
-        assert_eq!(cluster_of(local(2026, 7, 31, 12, 0), n), Cluster::LastWeek);
-        // Older = before last Monday (and before Aug 1 in this case).
-        assert_eq!(cluster_of(local(2026, 7, 26, 23, 59), n), Cluster::Older);
+        assert_eq!(cluster_of(local(2026, 8, 4, 0, 0), n), Cluster::Yesterday);
+        // Every earlier day gets its own date cluster, however far back.
+        let d = |y: i32, m: u32, day: u32| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        assert_eq!(
+            cluster_of(local(2026, 8, 3, 12, 0), n),
+            Cluster::Date(d(2026, 8, 3))
+        );
+        assert_eq!(
+            cluster_of(local(2026, 7, 31, 0, 0), n),
+            Cluster::Date(d(2026, 7, 31))
+        );
+        assert_eq!(
+            cluster_of(local(2025, 12, 3, 0, 0), n),
+            Cluster::Date(d(2025, 12, 3))
+        );
     }
 
     #[test]
-    fn cluster_this_month_kicks_in_when_1st_precedes_last_monday() {
-        // Now = Tue 2026-08-25: this Mon Aug 24, last Mon Aug 17, month 1st Aug 1.
-        let n = local(2026, 8, 25, 10, 0);
-        // Aug 16: before last Monday (Aug 17), after Aug 1 → This month.
-        assert_eq!(cluster_of(local(2026, 8, 16, 12, 0), n), Cluster::ThisMonth);
-        assert_eq!(cluster_of(local(2026, 8, 1, 0, 0), n), Cluster::ThisMonth);
-        // Aug 17 (last Monday) .. Aug 23 → Last week.
-        assert_eq!(cluster_of(local(2026, 8, 17, 0, 0), n), Cluster::LastWeek);
-        assert_eq!(cluster_of(local(2026, 8, 23, 23, 59), n), Cluster::LastWeek);
-        // Before Aug 1 → Older.
-        assert_eq!(cluster_of(local(2026, 7, 26, 12, 0), n), Cluster::Older);
-    }
-
-    #[test]
-    fn format_time_follows_the_spec_table() {
+    fn cluster_label_keeps_today_yesterday_and_shows_dates() {
         let n = now();
-        assert_eq!(format_time(local(2026, 8, 5, 14, 23), n), "14:23");
-        assert_eq!(format_time(local(2026, 8, 3, 0, 0), n), "Aug 3");
-        assert_eq!(format_time(local(2026, 1, 2, 0, 0), n), "Jan 2");
-        assert_eq!(format_time(local(2025, 12, 3, 0, 0), n), "2025-12-03");
+        assert_eq!(Cluster::Today.label(n), "Today");
+        assert_eq!(Cluster::Yesterday.label(n), "Yesterday");
+        let d = |y: i32, m: u32, day: u32| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        // Same year as now: no year in the header.
+        assert_eq!(Cluster::Date(d(2026, 8, 3)).label(n), "Mon, Aug 3");
+        // Different year: year appended so the header stays unambiguous.
+        assert_eq!(Cluster::Date(d(2025, 12, 3)).label(n), "Wed, Dec 3, 2025");
+    }
+
+    #[test]
+    fn format_time_is_always_hhmm() {
+        // The cluster headers carry the date context, so every row shows
+        // the time of day — even for this-year and older files.
+        assert_eq!(format_time(local(2026, 8, 5, 14, 23)), "14:23");
+        assert_eq!(format_time(local(2026, 8, 3, 9, 5)), "09:05");
+        assert_eq!(format_time(local(2026, 1, 2, 0, 0)), "00:00");
+        assert_eq!(format_time(local(2025, 12, 3, 23, 59)), "23:59");
     }
 
     #[test]

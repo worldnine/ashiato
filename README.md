@@ -2,7 +2,7 @@
 
 **ashiato**（足跡, "footprints") — see what your agent just touched.
 
-A TUI file picker that shows your whole project as a flat list sorted by modification time. Files your coding agent just edited float to the top, grouped into time clusters (Today / Yesterday / This week …), with a syntax-highlighted preview. Select files and print their paths to stdout — or hand them straight to a reviewer like [akapen](https://github.com/worldnine/akapen).
+A TUI file picker that shows your whole project as a flat list sorted by modification time. Files your coding agent just edited float to the top, grouped by day (Today / Yesterday, then a date header per older day), with a syntax-highlighted preview. Select files and print their paths to stdout — or hand them straight to a reviewer like [akapen](https://github.com/worldnine/akapen).
 
 日本語版 README は [README.ja.md](README.ja.md) にあります。
 

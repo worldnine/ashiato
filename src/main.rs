@@ -1,7 +1,8 @@
 //! ashiato — flat mtime-sorted file picker TUI (spec: ashiato-spec.md).
 //!
-//! Lists every file under a project root, newest first, clustered into
-//! Today / Yesterday / This week / Last week / This month / Older.
+//! Lists every file under a project root, newest first, clustered by
+//! day: Today / Yesterday, then one date header (`Wed, Aug 4`) per
+//! older day — no week/month/Older buckets.
 //! Space multi-selects, Enter hands the files to `--open-cmd` (default
 //! `akapen`), blocks until it exits, then rescans. `/` filters
 //! incrementally, `t` cycles the sort, Ctrl+h toggles hidden dirs, `d`
@@ -1361,9 +1362,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     for i in offset..offset.saturating_add(list_h).min(app.visible.len()) {
         match &app.visible[i] {
-            Row::Separator(c) => list_lines.push(separator_line(c.label(), list_width)),
+            Row::Separator(c) => {
+                list_lines.push(separator_line(&c.label(now), list_width))
+            },
             Row::File(idx) => {
-                list_lines.push(file_line(app, *idx, list_width, i == app.cursor, now));
+                list_lines.push(file_line(app, *idx, list_width, i == app.cursor));
             }
         }
     }
@@ -1490,8 +1493,8 @@ fn separator_line(label: &str, width: usize) -> Line<'static> {
 }
 
 /// One file row: marker + dir part (dimmed gray) + basename (theme fg,
-/// Cyan on the cursor row) + right-aligned datetime (gray; hidden when
-/// the name needs the width — the clusters already carry the time
+/// Cyan on the cursor row) + right-aligned time (gray; hidden when
+/// the name needs the width — the cluster headers carry the date
 /// context, so the name always wins). No icon (2026-08-05: the 📄/📁
 /// emoji was dropped — extension-based reading is enough, per the
 /// spec's no-icon stance). Cursor and Space-selected rows get the
@@ -1501,7 +1504,6 @@ fn file_line(
     idx: usize,
     width: usize,
     is_cursor: bool,
-    now: chrono::DateTime<chrono::Local>,
 ) -> Line<'static> {
     let e = &app.files[idx];
     let sel = app.selected.contains(&idx);
@@ -1530,7 +1532,7 @@ fn file_line(
     };
     // Layout priority: marker + dir + name fill the row first; the
     // datetime is right-aligned only when it fits.
-    let dt = format_time(to_local(e.mtime), now);
+    let dt = format_time(to_local(e.mtime));
     let dt_w = files::display_width(&dt);
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
