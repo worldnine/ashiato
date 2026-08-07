@@ -72,6 +72,8 @@ ashiato tracks terminal focus via xterm focus reporting (DECSET 1004; kitty, Wez
 - **While the terminal is unfocused** and files change, the rows keep their normal colors; only the **untouched files' times sink further** (dark gray + dim), so the touched files' times stand out by contrast — a quiet glance at the time column shows what the agent is touching. The footer shows `[away: N changed]`. Changes stack up (deduped, first-seen order) until you come back.
 - **When focus returns**, the display reverts to the normal listing instantly — no flash (the mtime sort already floated the changed files to the top).
 
+Changes are detected by `(mtime, size, is_dir)` — an edit that keeps all three (e.g. `touch -r` restoring the mtime after a same-size write) is not visible as a change; the preview cache has the same signature, so such edits can also leave a stale preview until the next real change.
+
 ## The review loop
 
 With `--open-cmd`, `Enter` launches your reviewer with the selected files, blocks until it exits, and rescans — freshly edited files are back on top for the next round:
