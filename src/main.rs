@@ -434,6 +434,12 @@ struct App {
     /// `--light` pattern: the same constants, resolved once at startup).
     ui_selected_bg: Color,
     ui_border: Color,
+    /// The time column's brightness ladder, computed from the theme fg
+    /// (ANSI Gray can render as bright as the fg itself, so the steps
+    /// must be RGB): fresh rows use the fg, `HH:MM` uses `ui_time_fg`,
+    /// away-dimmed rows use `ui_time_dim`.
+    ui_time_fg: Color,
+    ui_time_dim: Color,
     /// Preview pane cache: re-rendered only when the key changes.
     preview_cache: Option<(PreviewKey, Preview)>,
     /// Transient footer message (+ error flag → red + BEL).
@@ -984,6 +990,7 @@ fn run(config: Config) -> Result<()> {
             .or_else(|| light.then_some(DEFAULT_THEME_LIGHT)),
         light,
     );
+    let highlight_fg = highlight.default_fg();
     let mut app = App {
         config,
         root: root.clone(),
@@ -1002,6 +1009,8 @@ fn run(config: Config) -> Result<()> {
         highlight,
         ui_selected_bg: theme::selected_bg(light),
         ui_border: theme::border_color(light),
+        ui_time_fg: theme::dim(highlight_fg, light, 0.60),
+        ui_time_dim: theme::dim(highlight_fg, light, 0.35),
         preview_cache: None,
         status: None,
         pending_output: None,
@@ -1733,15 +1742,17 @@ fn file_line(
     let pad = avail.saturating_sub(left_w + dt_w);
     // The time column is a brightness ladder, no hue: fresh (`now`/
     // `Nm ago` — within the hour) in the theme fg like the basename,
-    // older `HH:MM` in gray, and away-diff sinks the untouched files'
-    // times to dark gray so the touched ones stand out by contrast
-    // (the sinking outranks the fresh accent — it is the whole point).
+    // older `HH:MM` a step darker, and away-diff sinks the untouched
+    // files' times darker still so the touched ones stand out by
+    // contrast (the sinking outranks the fresh accent — it is the whole
+    // point). The steps are RGB computed from the theme fg; see the
+    // `ui_time_*` field docs.
     let dt_fg = if away_diff && !in_away {
-        Color::DarkGray
+        app.ui_time_dim
     } else if is_fresh(now, to_local(e.mtime)) {
         fg
     } else {
-        Color::Gray
+        app.ui_time_fg
     };
     let mut spans = vec![
         Span::styled(marker, base.fg(name_fg)),
@@ -2115,6 +2126,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2174,6 +2187,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2212,6 +2227,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2267,6 +2284,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2323,6 +2342,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2402,6 +2423,8 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
+            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
+            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
