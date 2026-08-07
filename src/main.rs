@@ -1731,15 +1731,15 @@ fn file_line(
     // At least two columns of gap, or the name butts against the datetime.
     let show_dt = left_w + dt_w + 2 <= avail;
     let pad = avail.saturating_sub(left_w + dt_w);
-    // Away-diff sinks the untouched files' times to dark gray so the
-    // touched files' times stand out by contrast; that dimming outranks
-    // the fresh accent (sinking is the whole point). Otherwise the
-    // relative window (`now`/`Nm ago` — within the hour) gets the fresh
-    // accent so the hot rows read at a glance.
+    // The time column is a brightness ladder, no hue: fresh (`now`/
+    // `Nm ago` — within the hour) in the theme fg like the basename,
+    // older `HH:MM` in gray, and away-diff sinks the untouched files'
+    // times to dark gray so the touched ones stand out by contrast
+    // (the sinking outranks the fresh accent — it is the whole point).
     let dt_fg = if away_diff && !in_away {
         Color::DarkGray
     } else if is_fresh(now, to_local(e.mtime)) {
-        Color::Yellow
+        fg
     } else {
         Color::Gray
     };

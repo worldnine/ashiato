@@ -63,7 +63,7 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 
 The list rescans every 2 seconds; when an agent edits files in another pane, they float up live. Cursor and selection follow by path.
 
-Times are relative within the hour (`now`, `5m ago`) and shown in a yellow accent; anything older shows plain `HH:MM` in gray — "ago" appearing at all means "touched within the hour".
+Times are relative within the hour (`now`, `5m ago`) and shown in the default foreground like the filenames; anything older shows plain `HH:MM` in gray — a quiet brightness ladder where "ago" appearing at all means "touched within the hour".
 
 ### Away-diff (terminal focus)
 
