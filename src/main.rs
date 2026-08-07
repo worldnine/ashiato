@@ -410,6 +410,9 @@ struct App {
     /// Cursor position: index into `visible` (always a `Row::File`).
     cursor: usize,
     /// Scroll offset: index into `visible` of the first drawn row.
+    /// The wheel (`scroll_view`) moves it directly; key/mouse cursor
+    /// moves sync it via [`App::sync_offset`] so the view scrolls only
+    /// when the cursor crosses the window edge.
     offset: usize,
     /// Space-selected entries: indices into `files`.
     selected: BTreeSet<usize>,
@@ -725,6 +728,47 @@ impl App {
         let mut lines = vec![header];
         lines.extend(p.rows.iter().cloned());
         lines
+    }
+
+    /// Cursor one file row down (j / Down), skipping cluster
+    /// separators. The view follows via [`App::sync_offset`]: it
+    /// scrolls only when the cursor crosses the window's bottom edge.
+    fn move_down(&mut self, list_h: usize) {
+        let mut row = self.cursor;
+        while row + 1 < self.visible.len() {
+            row += 1;
+            if matches!(self.visible[row], Row::File(_)) {
+                break;
+            }
+        }
+        self.cursor = row;
+        self.sync_offset(list_h);
+    }
+
+    /// Cursor one file row up (k / Up), skipping separators.
+    fn move_up(&mut self, list_h: usize) {
+        let mut row = self.cursor;
+        while row > 0 {
+            row -= 1;
+            if matches!(self.visible[row], Row::File(_)) {
+                break;
+            }
+        }
+        self.cursor = row;
+        self.sync_offset(list_h);
+    }
+
+    /// Align the scroll offset with the cursor after a keyboard/mouse
+    /// move. The wheel adjusts `offset` itself, but key moves never
+    /// did — `effective_offset` re-derived the view from a stale
+    /// `offset` on every move, so at the window's bottom the next Up
+    /// keystroke re-scrolled the view under the cursor instead of
+    /// moving it (the cursor stayed glued to the bottom row; same at
+    /// the top after a wheel scroll). Syncing makes `offset` the
+    /// fixed point of `effective_offset`: the view scrolls only when
+    /// the cursor actually crosses the window edge (vim-style).
+    fn sync_offset(&mut self, list_h: usize) {
+        self.offset = self.effective_offset(list_h);
     }
 
     /// Number of file rows currently listed.
@@ -1154,29 +1198,15 @@ fn on_key(
         // from the Backspace key there, so plain Backspace is the same
         // hidden-dirs toggle (documented in --help).
         KeyCode::Backspace => toggle_hidden(app),
-        KeyCode::Char('j') | KeyCode::Down => {
-            let mut row = app.cursor;
-            while row + 1 < app.visible.len() {
-                row += 1;
-                if matches!(app.visible[row], Row::File(_)) {
-                    break;
-                }
-            }
-            app.cursor = row;
+        KeyCode::Char('j') | KeyCode::Down => app.move_down(height),
+        KeyCode::Char('k') | KeyCode::Up => app.move_up(height),
+        KeyCode::Char('g') => {
+            app.cursor = first_file_row(&app.visible);
+            app.sync_offset(height);
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            let mut row = app.cursor;
-            while row > 0 {
-                row -= 1;
-                if matches!(app.visible[row], Row::File(_)) {
-                    break;
-                }
-            }
-            app.cursor = row;
-        }
-        KeyCode::Char('g') => app.cursor = first_file_row(&app.visible),
         KeyCode::Char('G') => {
-            app.cursor = clamp_to_file(&app.visible, app.visible.len().saturating_sub(1))
+            app.cursor = clamp_to_file(&app.visible, app.visible.len().saturating_sub(1));
+            app.sync_offset(height);
         }
         // NOTE: a match guard applies to ALL or-patterns of an arm, so
         // PageDown/PageUp get their own guard-free arms — sharing the
@@ -1272,13 +1302,16 @@ fn toggle_hidden(app: &mut App) {
     app.rescan();
 }
 
-/// Half-page cursor movement (PgDn / Ctrl+d, PgUp / Ctrl+u).
+/// Half-page cursor movement (PgDn / Ctrl+d, PgUp / Ctrl+u). The
+/// view follows via [`App::sync_offset`] like the other key moves.
 fn half_page_down(app: &mut App, height: usize) {
     app.cursor = clamp_to_file(&app.visible, app.cursor + (height / 2).max(1));
+    app.sync_offset(height);
 }
 
 fn half_page_up(app: &mut App, height: usize) {
     app.cursor = clamp_to_file(&app.visible, app.cursor.saturating_sub((height / 2).max(1)));
+    app.sync_offset(height);
 }
 
 /// The filter input line: every key goes to the buffer (incremental — the
@@ -1463,6 +1496,7 @@ fn on_mouse(app: &mut App, mouse: MouseEvent) {
             let idx = app.effective_offset(list_h) + row;
             if idx < app.visible.len() && matches!(app.visible[idx], Row::File(_)) {
                 app.cursor = idx;
+                app.sync_offset(list_h);
             }
         }
         _ => {}
@@ -2513,6 +2547,49 @@ mod tests {
         // The selection must follow the file, not the slot: without the
         // remap, index 0 would now mean a.md.
         assert_eq!(app.selected_paths(), vec![p("/r/b.md")]);
+    }
+
+    #[test]
+    fn key_moves_scroll_the_view_only_at_the_window_edge() {
+        let mut app = test_app(Vec::new());
+        app.visible = (0..30).map(Row::File).collect();
+        let h = 10;
+        // j to the window's bottom: the view scrolls one row, the
+        // cursor sits on the bottom row.
+        for _ in 0..10 {
+            app.move_down(h);
+        }
+        assert_eq!(app.cursor, 10);
+        assert_eq!(app.offset, 1);
+        assert_eq!(app.cursor - app.offset, 9);
+        // k must move the cursor up within the window. (Regression:
+        // key moves never synced `offset`, so effective_offset
+        // re-scrolled the view under the cursor and it stayed glued
+        // to the bottom row.)
+        app.move_up(h);
+        assert_eq!(app.cursor, 9);
+        assert_eq!(app.offset, 1);
+        assert_eq!(app.cursor - app.offset, 8, "cursor leaves the bottom row");
+        // All the way down to the last file, then back up: the view
+        // follows the cursor, which climbs through the window.
+        while app.cursor < 29 {
+            app.move_down(h);
+        }
+        assert_eq!(app.offset, 20);
+        app.move_up(h);
+        assert_eq!(app.cursor, 28);
+        assert_eq!(app.offset, 20, "no re-scroll under a moving cursor");
+        // Wheel-scrolled state (cursor at the window's top): up keeps
+        // scrolling the view at the top edge (vim-style), down walks
+        // the cursor into the window without moving the view.
+        app.cursor = 5;
+        app.offset = 5;
+        app.move_up(h);
+        assert_eq!(app.cursor, 4);
+        assert_eq!(app.offset, 4, "top edge: up scrolls the view");
+        app.move_down(h);
+        assert_eq!(app.cursor, 5);
+        assert_eq!(app.offset, 4, "cursor inside the window: the view stays");
     }
 
     #[test]
