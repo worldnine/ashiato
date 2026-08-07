@@ -85,6 +85,25 @@ impl Sort {
     }
 }
 
+/// Paths whose entry differs between two listings, in `new`'s order:
+/// entries added, entries whose `(mtime, size, is_dir)` changed, then —
+/// appended last — entries that disappeared from the listing. The
+/// away-diff uses this to accumulate external edits while the terminal
+/// is unfocused.
+pub fn changed_paths(old: &[FileEntry], new: &[FileEntry]) -> Vec<PathBuf> {
+    let key = |e: &FileEntry| (e.mtime, e.size, e.is_dir);
+    let mut seen: std::collections::BTreeMap<&Path, (SystemTime, u64, bool)> =
+        old.iter().map(|e| (e.path.as_path(), key(e))).collect();
+    let mut out = Vec::new();
+    for e in new {
+        if seen.remove(e.path.as_path()) != Some(key(e)) {
+            out.push(e.path.clone());
+        }
+    }
+    out.extend(seen.into_keys().map(|p| p.to_path_buf()));
+    out
+}
+
 /// Sort `entries` in place by the given order; ties break on the relative
 /// path so the order is deterministic.
 pub fn sort_entries(entries: &mut [FileEntry], sort: Sort) {
@@ -412,6 +431,27 @@ mod tests {
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn changed_paths_lists_adds_edits_and_deletions() {
+        // edit b.md (mtime bump), add d.md, delete a.md.
+        let old = vec![entry("a.md", t(10)), entry("b.md", t(10)), entry("c.md", t(10))];
+        let new = vec![
+            entry("b.md", t(20)),
+            entry("c.md", t(10)),
+            entry("d.md", t(5)),
+        ];
+        let binding = changed_paths(&old, &new);
+        let names: Vec<&str> = binding
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect();
+        // New-list order, deletions appended last.
+        assert_eq!(names, vec!["/root/b.md", "/root/d.md", "/root/a.md"]);
+        // No changes at all → empty.
+        assert!(changed_paths(&old, &old).is_empty());
+        assert!(changed_paths(&new, &new).is_empty());
     }
 
     #[test]
