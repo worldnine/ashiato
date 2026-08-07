@@ -71,13 +71,15 @@ pub fn render(
     }
     match read_head(path) {
         Some((content, read_truncated)) => {
-            // Only the lines the pane can show are highlighted: each
-            // source line yields at least one display row, so line
-            // height+1 can never appear. The grammar context builds from
-            // the top, so cutting the tail is safe — without the cut a
-            // 256KB head is tokenized just to throw all but a dozen rows
-            // away (visible stutter on every cursor move).
-            let (head, line_truncated) = head_lines(&content, height);
+            // Only the cells the pane can show are highlighted: the head
+            // is cut at a line boundary once `width*height` characters
+            // are used up (and mid-line when a single line overflows the
+            // budget — minified bundles). The grammar context builds
+            // from the top, so cutting the tail is safe — without the
+            // cut a 256KB head is tokenized just to throw all but a
+            // dozen rows away (visible stutter on every cursor move:
+            // 1.5s on a minified bundle).
+            let (head, line_truncated) = head_lines_by_cells(&content, height, width);
             let spans = hl.highlight_with(head, syntax_for(path));
             let mut p = Preview::default();
             p.header = header_for(path, false);
@@ -158,16 +160,49 @@ fn trim_partial_utf8(buf: &mut Vec<u8>) {
     }
 }
 
-/// The first `n` lines of `s` (with their newlines) and whether anything
-/// was cut.
-fn head_lines(s: &str, n: usize) -> (&str, bool) {
-    let mut seen = 0;
-    for (i, b) in s.bytes().enumerate() {
-        if b == b'\n' {
-            seen += 1;
-            if seen >= n {
-                return (&s[..i + 1], i + 1 < s.len());
+/// The head of `s` that fits the pane: at most `height` lines, at most
+/// `width*height` characters total, and no line longer than `width*8`
+/// chars (cut mid-line when one overflows — minified bundles). The
+/// grammar builds from the top, so cutting the tail is safe; without the
+/// cuts a 256KB head is tokenized just to throw all but a dozen rows
+/// away, and syntect's per-line cost is superlinear, so a giant line
+/// must not be tokenized in full (a minified bundle was 1.5s, a markdown
+/// file with many short lines is bounded by the line count). Returns the
+/// cut and whether anything was cut.
+fn head_lines_by_cells(s: &str, height: usize, width: usize) -> (&str, bool) {
+    let budget = (height * width).max(1);
+    // One source line may wrap to at most this many rows.
+    let line_cap = (width * 8).max(1);
+    let mut used = 0usize;
+    let mut cut = 0usize;
+    let mut lines = 0usize;
+    for line in s.split_inclusive('\n') {
+        if lines >= height {
+            return (&s[..cut], true);
+        }
+        let total = line.chars().count();
+        let take = total.min(line_cap);
+        if used + take > budget {
+            if cut == 0 {
+                // The very first line overflows the whole pane: keep its
+                // head (char-aligned) so syntect never sees the tail.
+                let take = line
+                    .char_indices()
+                    .nth(budget)
+                    .map_or(line.len(), |(i, _)| i);
+                return (&s[..take], true);
             }
+            return (&s[..cut], true);
+        }
+        used += take;
+        // Advance by the bytes of the kept prefix (capped lines stop here).
+        cut += line
+            .char_indices()
+            .nth(take)
+            .map_or(line.len(), |(i, _)| i);
+        lines += 1;
+        if take < total {
+            return (&s[..cut], true);
         }
     }
     (s, false)
@@ -279,9 +314,27 @@ mod tests {
 
     #[test]
     fn head_lines_cuts_at_the_pane_height() {
-        assert_eq!(head_lines("a\nb\nc\n", 2), ("a\nb\n", true));
-        assert_eq!(head_lines("a\nb\n", 2), ("a\nb\n", false));
-        assert_eq!(head_lines("a\nb", 5), ("a\nb", false));
+        // Whole lines up to the cell budget, cut at the next boundary.
+        assert_eq!(head_lines_by_cells("a\nb\nc\nd\n", 2, 2), ("a\nb\n", true));
+        // Budget boundary lands exactly on a line end: no phantom cut.
+        assert_eq!(head_lines_by_cells("ab\ncd\n", 2, 3), ("ab\ncd\n", false));
+        assert_eq!(head_lines_by_cells("a\nb\n", 5, 10), ("a\nb\n", false));
+    }
+
+    #[test]
+    fn head_lines_bounds_long_lines_by_the_pane_area() {
+        // A minified one-liner: capped to the pane budget (the
+        // superlinear syntect cost is what made it a 1.5s render), and
+        // the line cap keeps each source line to 8 rows of the width.
+        let s = "x".repeat(10_000);
+        let (head, cut) = head_lines_by_cells(&s, 5, 10);
+        assert!(cut);
+        assert_eq!(head.chars().count(), 50); // the pane budget (5x10)
+        // CJK wide chars count as chars; the wrap loop caps the rows.
+        let s = format!("{}\n", "あ".repeat(100));
+        let (head, cut) = head_lines_by_cells(&s, 10, 5);
+        assert!(cut);
+        assert_eq!(head.chars().count(), 40); // width*8 = 5*8
     }
 
     #[test]

@@ -460,6 +460,12 @@ struct App {
     /// instead of re-rendering per key (speed first; see
     /// [`App::preview_lines`]).
     bursting: bool,
+    /// When a full preview render last finished. A key arriving within
+    /// [`BURST_GAP`] of it was pressed while the render was blocking the
+    /// loop (a hold, not a deliberate tap) — `mark_input` counts it as a
+    /// burst so a slow render cannot re-lock the hold into per-key
+    /// re-renders (the stutter cascade).
+    last_render_finish: Option<Instant>,
     /// Terminal keyboard focus (xterm focus reporting `CSI ? 1004h`).
     /// Terminals that don't emit focus events never flip this, so the
     /// away-diff feature stays dormant there.
@@ -724,6 +730,7 @@ impl App {
         }
         let p = preview::render(&e.path, e.size, e.is_dir, width, height, &self.highlight);
         self.preview_cache = Some((key, p));
+        self.last_render_finish = Some(Instant::now());
         let p = &self.preview_cache.as_ref().expect("just filled").1;
         let mut lines = vec![header];
         lines.extend(p.rows.iter().cloned());
@@ -1054,6 +1061,7 @@ fn run(config: Config) -> Result<()> {
         refresh_every: REFRESH_TICK,
         last_input: Instant::now(),
         bursting: false,
+        last_render_finish: None,
         focused: true,
         away_changes: Vec::new(),
         running: true,
@@ -1272,7 +1280,10 @@ fn on_key(
 /// A deliberate press after a pause renders the preview immediately.
 fn mark_input(app: &mut App) {
     let now = Instant::now();
-    app.bursting = now.duration_since(app.last_input) < BURST_GAP;
+    app.bursting = now.duration_since(app.last_input) < BURST_GAP
+        || app
+            .last_render_finish
+            .is_some_and(|t| now.duration_since(t) < BURST_GAP);
     app.last_input = now;
 }
 
@@ -2179,6 +2190,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2238,6 +2250,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2276,6 +2289,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2331,6 +2345,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2387,6 +2402,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2466,6 +2482,7 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
             running: true,
@@ -2484,6 +2501,28 @@ mod tests {
         assert!(app.bursting);
         std::thread::sleep(Duration::from_millis(100));
         mark_input(&mut app); // a deliberate press after a pause
+        assert!(!app.bursting);
+    }
+
+    #[test]
+    fn burst_tracker_counts_a_key_right_after_a_slow_render_as_burst() {
+        // The stutter cascade: a render that takes longer than BURST_GAP
+        // inflates the quiet gap, so the next repeat would look
+        // deliberate and re-render (per-key renders for the whole hold).
+        // A key arriving within BURST_GAP of the render's finish was
+        // queued during it — a hold, so it must count as a burst.
+        let mut app = test_app(Vec::new());
+        app.last_input = Instant::now() - Duration::from_millis(500);
+        mark_input(&mut app); // deliberate press: rendered immediately
+        assert!(!app.bursting);
+        // The render (slow, e.g. a minified bundle) just finished.
+        app.last_render_finish = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(10));
+        mark_input(&mut app); // the repeat queued behind the render
+        assert!(app.bursting, "a key within BURST_GAP of the render = hold");
+        // The burst ends normally once the key flow stops.
+        std::thread::sleep(Duration::from_millis(100));
+        mark_input(&mut app);
         assert!(!app.bursting);
     }
 
