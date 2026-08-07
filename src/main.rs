@@ -1019,13 +1019,7 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
         // deferred (see mark_input / preview_lines), and the poll wakes
         // exactly when the burst ends so the final preview pops ~BURST_GAP
         // after the key is released instead of waiting out the full tick.
-        let timeout = if app.bursting {
-            let quiet = app.last_input.elapsed();
-            Duration::from_millis(TICK_MS)
-                .min((BURST_GAP - quiet).max(Duration::from_millis(5)))
-        } else {
-            Duration::from_millis(TICK_MS)
-        };
+        let timeout = poll_timeout(app.bursting, app.last_input.elapsed());
         let mut any_input = false;
         if event::poll(timeout)? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
@@ -1193,6 +1187,19 @@ fn mark_input(app: &mut App) {
     let now = Instant::now();
     app.bursting = now.duration_since(app.last_input) < BURST_GAP;
     app.last_input = now;
+}
+
+/// バースト中の `event::poll` タイムアウト。バースト終了予定（前回入力から
+/// [`BURST_GAP`]）ちょうどに目覚めるよう残り時間を返すが、重いフレーム
+/// （プレビュー描画や再スキャン）の直後は `quiet` が既に BURST_GAP を
+/// 超えていることがあるため、飽和減算でパニックを避け下限 5ms に丸める。
+fn poll_timeout(bursting: bool, quiet: Duration) -> Duration {
+    if bursting {
+        Duration::from_millis(TICK_MS)
+            .min(BURST_GAP.saturating_sub(quiet).max(Duration::from_millis(5)))
+    } else {
+        Duration::from_millis(TICK_MS)
+    }
 }
 
 /// Ctrl+h / Backspace: toggle dot-directory visibility. Dot-FILES
@@ -1723,6 +1730,25 @@ mod tests {
             Action::Run(c) => c,
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn poll_timeout_does_not_panic_when_quiet_exceeds_burst_gap() {
+        // 重いフレームで quiet > BURST_GAP になっても飽和して 5ms に落ちる
+        // （以前は Duration の減算オーバーフローでパニックしていた）。
+        assert_eq!(
+            poll_timeout(true, BURST_GAP + Duration::from_secs(1)),
+            Duration::from_millis(5)
+        );
+        // ちょうど BURST_GAP でも同様。
+        assert_eq!(poll_timeout(true, BURST_GAP), Duration::from_millis(5));
+        // バースト継続中は残り時間まで眠る。
+        assert_eq!(
+            poll_timeout(true, Duration::from_millis(10)),
+            Duration::from_millis(TICK_MS).min(BURST_GAP - Duration::from_millis(10))
+        );
+        // 非バースト時は通常の tick。
+        assert_eq!(poll_timeout(false, Duration::ZERO), Duration::from_millis(TICK_MS));
     }
 
     #[test]
