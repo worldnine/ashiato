@@ -1747,12 +1747,20 @@ fn file_line(
     // contrast (the sinking outranks the fresh accent — it is the whole
     // point). The steps are RGB computed from the theme fg; see the
     // `ui_time_*` field docs.
+    let fresh = is_fresh(now, to_local(e.mtime));
     let dt_fg = if away_diff && !in_away {
         app.ui_time_dim
-    } else if is_fresh(now, to_local(e.mtime)) {
+    } else if fresh {
         fg
     } else {
         app.ui_time_fg
+    };
+    // Fresh times are also italic: a palette-independent cue that reads
+    // even where the brightness steps are subtle.
+    let dt_style = if fresh {
+        base.fg(dt_fg).add_modifier(Modifier::ITALIC)
+    } else {
+        base.fg(dt_fg)
     };
     let mut spans = vec![
         Span::styled(marker, base.fg(name_fg)),
@@ -1761,7 +1769,7 @@ fn file_line(
     ];
     if show_dt {
         spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(dt, base.fg(dt_fg)));
+        spans.push(Span::styled(dt, dt_style));
     }
     Line::from(spans)
 }
