@@ -67,8 +67,8 @@ The list rescans every 2 seconds; when an agent edits files in another pane, the
 
 ashiato tracks terminal focus via xterm focus reporting (DECSET 1004; kitty, WezTerm, Ghostty, alacritty, xterm, Terminal.app, iTerm2, Windows Terminal; tmux needs `focus-events on`). Terminals that never emit focus events simply keep the feature dormant.
 
-- **While the terminal is unfocused** and files change, the listing dims to gray; the touched files keep a `+` marker and their **time stays in the default color** — a glance at the pane shows what the agent is touching. The footer shows `[away: N changed]`. Changes stack up (deduped, first-seen order) until you come back.
-- **When focus returns**, the changed files **flash yellow three times**, the footer switches to `[N changed since you left]`, then the display reverts to the normal listing (the mtime sort already floated those files to the top).
+- **While the terminal is unfocused** and files change, the rows keep their normal colors; only the **untouched files' times dim to dark gray**, so the touched files' times stand out by contrast — a quiet glance at the time column shows what the agent is touching. The footer shows `[away: N changed]`. Changes stack up (deduped, first-seen order) until you come back.
+- **When focus returns**, the display reverts to the normal listing instantly — no flash (the mtime sort already floated the changed files to the top).
 
 ## The review loop
 

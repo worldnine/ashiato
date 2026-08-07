@@ -177,11 +177,12 @@ pub fn to_local(t: SystemTime) -> chrono::DateTime<Local> {
     t.into()
 }
 
-/// Row time display: **relative within the last 24 hours** (`now`, `5m ago`,
-/// `3h ago`), then the plain time of day (`HH:MM`) for anything older — the
-/// cluster headers carry the date context, so older rows need only the time.
-/// Relative spans are elapsed-time based, never calendar words: at 00:10 a
-/// file from 23:50 yesterday is `20m ago`, which is what "how fresh" means.
+/// Row time display: **relative within the last hour** (`now`, `5m ago`),
+/// then the plain time of day (`HH:MM`) — the cluster headers carry the
+/// date context, so older rows need only the time. Relative spans are
+/// elapsed-time based, never calendar words. `ago` appearing at all means
+/// "touched within the hour"; beyond that `HH:MM` says exactly when, which
+/// beats `3h ago` (and `2m ago` vs `3h ago` were too easy to misread).
 pub fn format_time(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> String {
     let elapsed = now.signed_duration_since(t);
     if elapsed < chrono::Duration::seconds(60) {
@@ -189,8 +190,6 @@ pub fn format_time(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> 
         "now".to_string()
     } else if elapsed < chrono::Duration::minutes(60) {
         format!("{}m ago", elapsed.num_minutes())
-    } else if elapsed < chrono::Duration::hours(24) {
-        format!("{}h ago", elapsed.num_hours())
     } else {
         format!("{:02}:{:02}", t.hour(), t.minute())
     }
@@ -386,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn format_time_is_relative_within_24h_then_hhmm() {
+    fn format_time_is_relative_within_1h_then_hhmm() {
         let n = now(); // 2026-08-05 14:00:00
         // < 60s: "now" (also the clamp for future/clock-skew timestamps).
         assert_eq!(format_time(n, n - chrono::Duration::seconds(59)), "now");
@@ -395,12 +394,11 @@ mod tests {
         assert_eq!(format_time(n, n - chrono::Duration::seconds(60)), "1m ago");
         assert_eq!(format_time(n, n - chrono::Duration::minutes(5)), "5m ago");
         assert_eq!(format_time(n, n - chrono::Duration::minutes(59)), "59m ago");
-        // 1–23 hours.
-        assert_eq!(format_time(n, n - chrono::Duration::hours(1)), "1h ago");
-        assert_eq!(format_time(n, n - chrono::Duration::hours(23)), "23h ago");
-        // ≥ 24h: back to HH:MM — the cluster headers carry the date context.
+        // ≥ 1h: HH:MM — the cluster headers carry the date context, and
+        // "ago" appearing at all means "within the hour".
+        assert_eq!(format_time(n, n - chrono::Duration::hours(1)), "13:00");
+        assert_eq!(format_time(n, n - chrono::Duration::hours(23)), "15:00");
         assert_eq!(format_time(n, n - chrono::Duration::hours(24)), "14:00");
-        assert_eq!(format_time(n, n - chrono::Duration::hours(29)), "09:00");
         assert_eq!(format_time(n, local(2026, 8, 3, 9, 5)), "09:05");
     }
 
