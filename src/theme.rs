@@ -42,18 +42,6 @@ pub fn border_color(light: bool) -> Color {
     if light { BORDER_LIGHT } else { BORDER_DARK }
 }
 
-/// Blend `fg` toward the assumed background (black in dark mode, white in
-/// light mode), keeping `keep` of the foreground. ANSI palette colors
-/// (`Color::Gray` etc.) render at terminal-defined brightness — often
-/// indistinguishable from the theme fg — so brightness ladders must be
-/// computed in RGB from the theme fg instead. Non-RGB inputs pass through
-/// unchanged (in practice `Highlighter::default_fg()` is always RGB).
-pub fn dim(fg: Color, light: bool, keep: f32) -> Color {
-    let Color::Rgb(r, g, b) = fg else { return fg };
-    let bg = if light { 255.0 } else { 0.0 };
-    let mix = |c: u8| (f32::from(c) * keep + bg * (1.0 - keep)).round() as u8;
-    Color::Rgb(mix(r), mix(g), mix(b))
-}
 
 /// Ask the terminal for its background color and decide light/dark.
 /// `None` = unknown (no tty, no answer, unparseable) — the caller falls
@@ -285,13 +273,4 @@ mod tests {
         assert_eq!(border_color(true), Color::Rgb(180, 180, 190));
     }
 
-    #[test]
-    fn dim_blends_toward_the_assumed_background() {
-        // Dark mode: toward black; light mode: toward white.
-        assert_eq!(dim(Color::Rgb(200, 100, 0), false, 0.5), Color::Rgb(100, 50, 0));
-        assert_eq!(dim(Color::Rgb(200, 100, 0), true, 0.5), Color::Rgb(228, 178, 128));
-        // keep=1.0 is the identity; non-RGB colors pass through.
-        assert_eq!(dim(Color::Rgb(1, 2, 3), false, 1.0), Color::Rgb(1, 2, 3));
-        assert_eq!(dim(Color::Gray, false, 0.5), Color::Gray);
-    }
 }

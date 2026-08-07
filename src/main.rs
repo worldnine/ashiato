@@ -434,12 +434,6 @@ struct App {
     /// `--light` pattern: the same constants, resolved once at startup).
     ui_selected_bg: Color,
     ui_border: Color,
-    /// The time column's brightness ladder, computed from the theme fg
-    /// (ANSI Gray can render as bright as the fg itself, so the steps
-    /// must be RGB): fresh rows use the fg, `HH:MM` uses `ui_time_fg`,
-    /// away-dimmed rows use `ui_time_dim`.
-    ui_time_fg: Color,
-    ui_time_dim: Color,
     /// Preview pane cache: re-rendered only when the key changes.
     preview_cache: Option<(PreviewKey, Preview)>,
     /// Transient footer message (+ error flag → red + BEL).
@@ -990,7 +984,6 @@ fn run(config: Config) -> Result<()> {
             .or_else(|| light.then_some(DEFAULT_THEME_LIGHT)),
         light,
     );
-    let highlight_fg = highlight.default_fg();
     let mut app = App {
         config,
         root: root.clone(),
@@ -1009,8 +1002,6 @@ fn run(config: Config) -> Result<()> {
         highlight,
         ui_selected_bg: theme::selected_bg(light),
         ui_border: theme::border_color(light),
-        ui_time_fg: theme::dim(highlight_fg, light, 0.60),
-        ui_time_dim: theme::dim(highlight_fg, light, 0.35),
         preview_cache: None,
         status: None,
         pending_output: None,
@@ -1648,48 +1639,48 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 }
 
+/// Secondary-text style: the terminal's default foreground with the DIM
+/// attribute (SGR 2) — the terminal picks its own "quieter fg", which
+/// tracks the user's palette and stays readable where a hard-coded
+/// bright-black (`DarkGray`) can sink into the background.
+fn dim_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
 fn hint(key: &str, action: &str) -> Span<'static> {
-    Span::styled(
-        format!("{key}:{action}  "),
-        Style::default().fg(Color::DarkGray),
-    )
+    Span::styled(format!("{key}:{action}  "), dim_style())
 }
 
 fn toggle_span(name: &str, on: bool) -> Span<'static> {
     Span::styled(
         format!("[{name}]"),
-        if on {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        },
+        if on { Style::default() } else { dim_style() },
     )
 }
 
 fn separator_line(label: &str, width: usize) -> Line<'static> {
     let head = format!("── {label} ");
     let fill = "─".repeat(width.saturating_sub(files::display_width(&head)));
-    Line::from(Span::styled(
-        format!("{head}{fill}"),
-        Style::default().fg(Color::DarkGray),
-    ))
+    Line::from(Span::styled(format!("{head}{fill}"), dim_style()))
 }
 
-/// One file row: marker + dir part (dimmed gray) + basename (theme fg,
-/// Cyan on the cursor row) + right-aligned time (`now`/`5m ago` in the
-/// fresh accent within the hour, else `HH:MM` in gray; hidden when the
-/// name needs the width — the cluster headers carry the date context,
-/// so the name always wins).
+/// One file row: marker + dir part (DIM) + basename (terminal default
+/// fg, Cyan on the cursor row) + right-aligned time (DIM; italic within
+/// the hour — freshness is typography, not color; hidden when the name
+/// needs the width — the cluster headers carry the date context, so the
+/// name always wins). The list respects the terminal palette: default
+/// fg + DIM for secondary text, ANSI accents only (2026-08-07; the
+/// syntect theme fg / RGB ladder experiments were dropped).
 /// No icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
 /// reading is enough, per the spec's no-icon stance). Cursor and
 /// Space-selected rows get the akapen gray background (spec).
 ///
 /// Away-diff mode (terminal unfocused with a non-empty away stack):
 /// the rows keep their normal colors; only the *untouched* files' times
-/// dim to dark gray, so the touched files' times read as the fresh ones
-/// by contrast (2026-08-07: the earlier whole-list dim + `+` marker +
-/// focus-return flash were dropped as too loud). Focus return reverts
-/// instantly.
+/// sink further (DarkGray + DIM), so the touched files' times read as
+/// the fresh ones by contrast (2026-08-07: the earlier whole-list dim +
+/// `+` marker + focus-return flash were dropped as too loud). Focus
+/// return reverts instantly.
 fn file_line(
     app: &App,
     idx: usize,
@@ -1716,8 +1707,11 @@ fn file_line(
     } else {
         "  "
     };
-    let fg = app.highlight.default_fg();
-    let name_fg = if is_cursor { Color::Cyan } else { fg };
+    let name_style = if is_cursor {
+        base.fg(Color::Cyan)
+    } else {
+        base // no fg: the terminal's default foreground
+    };
     // Split the relative path: the directory part is dimmed, the
     // basename is the star of the row.
     let rel = e.display_rel();
@@ -1740,32 +1734,22 @@ fn file_line(
     // At least two columns of gap, or the name butts against the datetime.
     let show_dt = left_w + dt_w + 2 <= avail;
     let pad = avail.saturating_sub(left_w + dt_w);
-    // The time column is a brightness ladder, no hue: fresh (`now`/
-    // `Nm ago` — within the hour) in the theme fg like the basename,
-    // older `HH:MM` a step darker, and away-diff sinks the untouched
-    // files' times darker still so the touched ones stand out by
-    // contrast (the sinking outranks the fresh accent — it is the whole
-    // point). The steps are RGB computed from the theme fg; see the
-    // `ui_time_*` field docs.
+    // The time is secondary text (DIM). Freshness (`now`/`Nm ago` —
+    // within the hour) is italic, not a color. Away-diff sinks the
+    // untouched files' times a step further (DarkGray + DIM) so the
+    // touched ones stand out by contrast — the sinking outranks the
+    // fresh cue: it is the whole point.
     let fresh = is_fresh(now, to_local(e.mtime));
-    let dt_fg = if away_diff && !in_away {
-        app.ui_time_dim
+    let mut dt_style = base.add_modifier(Modifier::DIM);
+    if away_diff && !in_away {
+        dt_style = dt_style.fg(Color::DarkGray);
     } else if fresh {
-        fg
-    } else {
-        app.ui_time_fg
-    };
-    // Fresh times are also italic: a palette-independent cue that reads
-    // even where the brightness steps are subtle.
-    let dt_style = if fresh {
-        base.fg(dt_fg).add_modifier(Modifier::ITALIC)
-    } else {
-        base.fg(dt_fg)
-    };
+        dt_style = dt_style.add_modifier(Modifier::ITALIC);
+    }
     let mut spans = vec![
-        Span::styled(marker, base.fg(name_fg)),
-        Span::styled(dir, base.fg(Color::DarkGray)),
-        Span::styled(name, base.fg(name_fg)),
+        Span::styled(marker, name_style),
+        Span::styled(dir, base.add_modifier(Modifier::DIM)),
+        Span::styled(name, name_style),
     ];
     if show_dt {
         spans.push(Span::styled(" ".repeat(pad), base));
@@ -2134,8 +2118,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2195,8 +2177,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2235,8 +2215,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2292,8 +2270,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2350,8 +2326,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
@@ -2431,8 +2405,6 @@ mod tests {
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
-            ui_time_fg: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.60),
-            ui_time_dim: theme::dim(Highlighter::new(None, false).default_fg(), false, 0.35),
             preview_cache: None,
             status: None,
             pending_output: None,
