@@ -34,6 +34,8 @@ mod theme;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -202,25 +204,44 @@ impl Since {
                     .date_naive()
                     .and_hms_opt(0, 0, 0)
                     .expect("midnight exists");
-                let dt = chrono::Local
-                    .from_local_datetime(&midnight)
-                    .single()
-                    .expect("midnight is unambiguous");
-                dt.into()
+                midnight_cutoff(midnight, &mut |m| chrono::Local.from_local_datetime(&m))
             }
             Since::Yesterday => {
                 let midnight = (now.date_naive() - chrono::Duration::days(1))
                     .and_hms_opt(0, 0, 0)
                     .expect("midnight exists");
-                let dt = chrono::Local
-                    .from_local_datetime(&midnight)
-                    .single()
-                    .expect("midnight is unambiguous");
-                dt.into()
+                midnight_cutoff(midnight, &mut |m| chrono::Local.from_local_datetime(&m))
             }
             Since::Days(n) => {
                 let dt = now - chrono::Duration::days(*n);
                 dt.into()
+            }
+        }
+    }
+}
+
+/// The timestamp of a local midnight, falling back to the closest real
+/// one. `resolve` maps a naive local time to its instants: a midnight
+/// the clock skips entirely (a whole-day DST jump — Pacific/Apia
+/// skipped 2011-12-30) yields `None`, and a fall-back midnight yields
+/// `Ambiguous` (two instants). Both fall back to the earliest existing
+/// start-of-day, so the cutoff can never panic on a broken local day.
+fn midnight_cutoff(
+    midnight: chrono::NaiveDateTime,
+    resolve: &mut impl FnMut(
+        chrono::NaiveDateTime,
+    ) -> chrono::LocalResult<chrono::DateTime<chrono::Local>>,
+) -> std::time::SystemTime {
+    let mut day = midnight;
+    loop {
+        match resolve(day) {
+            chrono::LocalResult::Single(dt) => return dt.into(),
+            chrono::LocalResult::Ambiguous(a, b) => return a.min(b).into(),
+            chrono::LocalResult::None => {
+                // The whole day is skipped (DST jumps move the clock at
+                // most a day): step back to the previous midnight, which
+                // always exists.
+                day -= chrono::Duration::days(1);
             }
         }
     }
@@ -1032,6 +1053,135 @@ fn rebind_to_controlling_pty() -> bool {
     false
 }
 
+/// True while the TUI owns the terminal (raw mode on). The
+/// SIGINT/SIGTERM handler restores the terminal only then: while a
+/// child process owns it (open_selection's raw-off window) a signal
+/// must leave the child's terminal alone.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard for the TUI's terminal state: raw mode and, once
+/// entered, the alternate screen. Drop restores exactly what is on,
+/// so errors, panics, and early returns can't leave the user's shell
+/// in raw mode on a phantom screen. The state flags keep the
+/// child-process window (open_selection) from being restored twice:
+/// while the child owns the terminal both are off and Drop is a no-op.
+struct TermGuard {
+    /// The TUI terminal; `None` until `make_terminal` succeeds.
+    term: Option<Term>,
+    /// Raw mode is currently enabled (mirrored by [`TUI_ACTIVE`]).
+    raw: bool,
+    /// The alternate screen is currently entered.
+    alt: bool,
+}
+
+impl TermGuard {
+    /// Raw mode is on: the signal handler must restore the terminal.
+    fn raw_on(&mut self) {
+        self.raw = true;
+        TUI_ACTIVE.store(true, Ordering::SeqCst);
+    }
+
+    /// Raw mode is off (a child or the shell owns the terminal): the
+    /// signal handler must leave it alone.
+    fn raw_off(&mut self) {
+        self.raw = false;
+        TUI_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        // The signal handler must not restore after we have (a signal
+        // landing mid-restore would double-leave the alternate screen).
+        TUI_ACTIVE.store(false, Ordering::SeqCst);
+        if self.alt && let Some(t) = &mut self.term {
+            let _ = execute!(
+                t.backend_mut(),
+                Show,
+                DisableMouseCapture,
+                LeaveAlternateScreen,
+                DisableFocusChange
+            );
+        }
+        if self.raw {
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+impl std::ops::Deref for TermGuard {
+    type Target = Term;
+
+    fn deref(&self) -> &Term {
+        self.term
+            .as_ref()
+            .expect("TermGuard: the TUI terminal is not armed")
+    }
+}
+
+impl std::ops::DerefMut for TermGuard {
+    fn deref_mut(&mut self) -> &mut Term {
+        self.term
+            .as_mut()
+            .expect("TermGuard: the TUI terminal is not armed")
+    }
+}
+
+/// The restore sequences the signal handler writes (built once from the
+/// real crossterm commands, so they can't drift from the normal teardown;
+/// the handler itself must not allocate or open anything).
+static TERMINAL_RESTORE: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// SIGINT/SIGTERM handler: leave the alternate screen (and show the
+/// cursor, stop mouse/focus reporting), then re-raise with the default
+/// disposition so the process dies with the conventional signal status.
+/// The handler writes only to the already-open stdout/stderr fds: on
+/// macOS, opening /dev/tty or calling tcsetattr from a handler races
+/// with process exit (with crossterm's kqueue in flight) and can hang
+/// the dying process in the kernel. Raw mode is left to the shell,
+/// which restores the termios when the job dies.
+extern "C" fn restore_terminal_and_die(sig: libc::c_int) {
+    if TUI_ACTIVE.load(Ordering::SeqCst) {
+        // Both fds are the terminal in the normal case; when stdout is
+        // piped (--output), stderr still is.
+        if let Some(bytes) = TERMINAL_RESTORE.get() {
+            for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                unsafe {
+                    libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+                }
+            }
+        }
+    }
+    unsafe {
+        // SAFETY: re-raising with the default disposition kills us with
+        // the status the shell expects (128 + signum).
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Install the terminal-restoring signal handlers. In raw mode the tty
+/// never delivers SIGINT for Ctrl+C (that arrives as a key event), so
+/// these cover SIGTERM and signals sent from outside.
+fn install_signal_handlers() {
+    // Build the restore bytes eagerly: the handler must not allocate.
+    let mut restore = Vec::new();
+    let _ = ratatui::crossterm::queue!(
+        restore,
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableFocusChange
+    );
+    let _ = TERMINAL_RESTORE.set(restore);
+    unsafe {
+        // SAFETY: `restore_terminal_and_die` is a valid handler, and
+        // the default disposition is restored before it re-raises.
+        libc::signal(libc::SIGINT, restore_terminal_and_die as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, restore_terminal_and_die as libc::sighandler_t);
+    }
+}
+
 fn run(config: Config) -> Result<()> {
     // `--files`: the time-ordered listing as a data source (pipes, fzf).
     // No TUI → no tty juggling either (ensure_terminal_stdin scans
@@ -1040,12 +1190,25 @@ fn run(config: Config) -> Result<()> {
         return run_files(&config);
     }
     ensure_terminal_stdin();
+    // SIGTERM and external SIGINT must not leave the terminal broken:
+    // the handler restores it, then the default disposition re-raises.
+    install_signal_handlers();
     let root = resolve_root(config.dir.as_deref())?;
     // Light/dark resolution: --light/--dark win, else the terminal's
     // background is queried (OSC 11). The query needs raw mode (the
     // answer is plain bytes on stdin), so raw mode is enabled before
     // the App is built; unanswerable terminals fall back to dark.
     ratatui::crossterm::terminal::enable_raw_mode()?;
+    // The guard owns the terminal state from here on: Drop restores
+    // raw mode and the alternate screen on every exit path (errors,
+    // panics, early returns). open_selection disarms it while a child
+    // owns the terminal, so nothing restores twice.
+    let mut guard = TermGuard {
+        term: None,
+        raw: false,
+        alt: false,
+    };
+    guard.raw_on();
     let light = config
         .light
         .unwrap_or_else(|| theme::detect_light().unwrap_or(false));
@@ -1094,22 +1257,16 @@ fn run(config: Config) -> Result<()> {
     app.sort = app.config.sort;
     app.show_hidden = app.config.show_hidden;
     app.show_dirs = app.config.show_dirs;
-    let mut terminal = match make_terminal() {
-        Ok(t) => t,
-        Err(e) => {
-            // Raw mode is already on: restore it before bailing, or the
-            // user's shell is left in raw mode.
-            let _ = ratatui::crossterm::terminal::disable_raw_mode();
-            return Err(e);
-        }
-    };
-    let _ = enter_tui_modes(terminal.backend_mut());
+    let terminal = make_terminal()?; // the guard restores raw mode on error
+    guard.term = Some(terminal);
+    let _ = enter_tui_modes(guard.backend_mut());
+    guard.alt = true;
     // The first scan blocks the event loop — on a huge tree it takes
     // seconds, and with the alternate screen already up that reads as a
     // frozen/black screen. Draw a "scanning" status before the scan;
     // event_loop's opening draw renders the result the moment it returns.
     app.flash("scanning…");
-    terminal.draw(|f| draw(f, &mut app))?;
+    guard.draw(|f| draw(f, &mut app))?;
     // The `--filter`/`--since` seeds apply to the first scan; `/` edits
     // the filter later.
     app.filter = app.config.filter.clone();
@@ -1124,15 +1281,10 @@ fn run(config: Config) -> Result<()> {
         // The scan is done and the listing is live: drop the placeholder.
         app.status = None;
     }
-    let res = event_loop(&mut terminal, &mut app);
-    let _ = execute!(
-        terminal.backend_mut(),
-        Show,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableFocusChange
-    );
-    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    let res = event_loop(&mut guard, &mut app);
+    // The guard's Drop restores the terminal (alternate screen + raw
+    // mode) before the output prints below.
+    drop(guard);
     // `--output` mode: the paths print only after the TUI is fully down,
     // to the (piped) stdout — the TUI rendered on /dev/tty, so the pipe
     // carries nothing but the paths.
@@ -1144,7 +1296,7 @@ fn run(config: Config) -> Result<()> {
     res
 }
 
-fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
+fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
     terminal.draw(|f| draw(f, app))?;
     loop {
         // Burst-aware poll: while the user is mashing j/k the preview is
@@ -1216,10 +1368,10 @@ fn on_key(
     app: &mut App,
     key: KeyCode,
     modifiers: KeyModifiers,
-    terminal: Option<&mut Term>,
+    terminal: Option<&mut TermGuard>,
 ) {
     if app.filter_active {
-        return on_filter_key(app, key, modifiers);
+        return on_filter_key(app, key, modifiers, terminal);
     }
     let height = list_height(
         ratatui::crossterm::terminal::size()
@@ -1279,6 +1431,14 @@ fn on_key(
             app.rescan();
         }
         KeyCode::Char('q') => app.running = false,
+        // Raw mode eats the tty's SIGINT, so Ctrl+C arrives as a key
+        // here, not as a signal; quit like `q` (a dead ^C would trap
+        // the user in the TUI). Ctrl+Z is likewise swallowed: suspend
+        // explicitly (the terminal is restored and SIGTSTP raised).
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.running = false,
+        KeyCode::Char('z') if modifiers.contains(KeyModifiers::CONTROL) => {
+            suspend_tui(app, terminal)
+        }
         // Filter on/off toggle: the text is preserved, so `\` again
         // restores the same view (`--filter` is the context's default
         // view; this is the quick way to step out of it and back).
@@ -1352,7 +1512,12 @@ fn half_page_up(app: &mut App, height: usize) {
 
 /// The filter input line: every key goes to the buffer (incremental — the
 /// list re-filters on each keystroke).
-fn on_filter_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+fn on_filter_key(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+    terminal: Option<&mut TermGuard>,
+) {
     match key {
         KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
             // Typing re-applies the filter (incremental).
@@ -1377,6 +1542,13 @@ fn on_filter_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
             app.filter_active = false;
             app.rebuild_visible(None);
         }
+        // Ctrl+C quits even while the filter input is active (the
+        // universal interrupt habit must not be a dead key here
+        // either); Ctrl+Z suspends like everywhere else.
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.running = false,
+        KeyCode::Char('z') if modifiers.contains(KeyModifiers::CONTROL) => {
+            suspend_tui(app, terminal)
+        }
         _ => {}
     }
 }
@@ -1384,7 +1556,7 @@ fn on_filter_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
 /// Enter: with `--open-cmd` given, hand the target files to it (blocking),
 /// then rescan; without one (or with `--output`) queue the paths for
 /// stdout and exit — the generic picker behavior.
-fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
+fn open_selection(app: &mut App, mut terminal: Option<&mut TermGuard>) {
     let paths = app.target_paths();
     if paths.is_empty() {
         app.flash_err("no files");
@@ -1396,23 +1568,30 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
         return;
     }
     let cmd = expand_cmd(app.config.open_cmd.as_deref().expect("checked above"), &paths);
-    // Suspend the TUI while the child owns the terminal (akapen's
-    // editor pattern): leave the alternate screen and raw mode.
-    if let Some(t) = terminal.as_deref_mut() {
-        let _ = execute!(t.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
+    if let Some(g) = terminal.as_deref_mut() {
+        // Suspend the TUI while the child owns the terminal (akapen's
+        // editor pattern): leave the alternate screen and raw mode, and
+        // disarm the guard — the child owns the terminal now, so a
+        // panic or signal mid-child must not restore it out from under
+        // the child.
+        let _ = execute!(g.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
+        g.alt = false;
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+        g.raw_off();
     }
-    let _ = ratatui::crossterm::terminal::disable_raw_mode();
     let status = Command::new("sh").arg("-c").arg(&cmd).status();
-    // Re-enter raw mode and rebuild a fresh terminal for the TUI.
-    let _ = ratatui::crossterm::terminal::enable_raw_mode();
-    if let Some(t) = terminal.as_deref_mut() {
+    if let Some(g) = terminal.as_deref_mut() {
+        // Re-enter raw mode and rebuild a fresh terminal for the TUI.
+        let _ = ratatui::crossterm::terminal::enable_raw_mode();
+        g.raw_on();
         match make_terminal() {
             Ok(term) => {
-                *t = term;
+                **g = term;
                 // Re-send focus reporting along with the screen re-entry:
                 // the child may have sent DisableFocusChange on its way
                 // out, which would kill the away-diff silently.
-                let _ = enter_tui_modes(t.backend_mut());
+                let _ = enter_tui_modes(g.backend_mut());
+                g.alt = true;
             }
             Err(e) => {
                 app.flash_err(format!("terminal restore failed: {e:#}"));
@@ -1444,6 +1623,71 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
         )),
         Err(e) => app.flash_err(format!("spawn failed: {e}")),
     }
+    app.needs_immediate_redraw = true;
+}
+
+/// Whether our process group owns the controlling terminal: the shell
+/// can `fg` us back only then. A background job must not stop itself
+/// — no shell would resume it.
+fn is_foreground() -> bool {
+    unsafe {
+        // SAFETY: fd 0 is a valid, open tty here (ensure_terminal_stdin).
+        libc::tcgetpgrp(libc::STDIN_FILENO) == libc::getpgrp()
+    }
+}
+
+/// Ctrl+Z: suspend the TUI like a normal foreground job. The terminal
+/// is restored first (alternate screen left, raw mode off), then
+/// SIGTSTP's default disposition stops us; the shell prints its
+/// prompt, and `fg` resumes here with the TUI rebuilt — the same
+/// restore → child → rebuild pattern as [`open_selection`].
+fn suspend_tui(app: &mut App, terminal: Option<&mut TermGuard>) {
+    let Some(g) = terminal else {
+        return;
+    };
+    if !is_foreground() {
+        app.flash("not a foreground job — can't suspend");
+        return;
+    }
+    let _ = execute!(
+        g.backend_mut(),
+        LeaveAlternateScreen,
+        Show,
+        DisableMouseCapture,
+        DisableFocusChange
+    );
+    g.alt = false;
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    g.raw_off();
+    unsafe {
+        // SAFETY: SIGTSTP's default action stops us; the terminal is
+        // already restored, so the shell gets a clean prompt.
+        libc::raise(libc::SIGTSTP);
+    }
+    // Resumed (fg): re-enter raw mode and rebuild the TUI.
+    let _ = ratatui::crossterm::terminal::enable_raw_mode();
+    g.raw_on();
+    match make_terminal() {
+        Ok(term) => {
+            **g = term;
+            let _ = execute!(
+                g.backend_mut(),
+                EnterAlternateScreen,
+                Hide,
+                EnableMouseCapture,
+                EnableFocusChange
+            );
+            g.alt = true;
+        }
+        Err(e) => {
+            app.flash_err(format!("terminal restore failed: {e:#}"));
+            app.running = false;
+        }
+    }
+    // The terminal was the shell's while we were stopped: the focus
+    // state is stale, like after a child command.
+    app.focused = true;
+    app.away_changes.clear();
     app.needs_immediate_redraw = true;
 }
 
@@ -2094,6 +2338,85 @@ mod tests {
     }
 
     #[test]
+    fn since_yesterday_cutoff_is_the_previous_local_midnight() {
+        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 14, 23, 0).unwrap();
+        let cutoff = Since::Yesterday.cutoff(now);
+        let dt: chrono::DateTime<chrono::Local> = cutoff.into();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-04 00:00:00");
+    }
+
+    #[test]
+    fn midnight_cutoff_uses_the_single_instant() {
+        let midnight = chrono::NaiveDate::from_ymd_opt(2026, 8, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let expected = chrono::Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let cutoff = midnight_cutoff(midnight, &mut |m| {
+            assert_eq!(m, midnight, "probes the requested day first");
+            chrono::LocalResult::Single(expected)
+        });
+        let expected: std::time::SystemTime = expected.into();
+        assert_eq!(cutoff, expected);
+    }
+
+    #[test]
+    fn midnight_cutoff_prefers_the_earliest_ambiguous_instant() {
+        // DST fall-back: the midnight occurs twice; the cutoff is the
+        // earlier occurrence (the day's true start).
+        let midnight = chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let early = chrono::Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let late = early + chrono::Duration::hours(1);
+        let cutoff = midnight_cutoff(midnight, &mut |_| {
+            chrono::LocalResult::Ambiguous(early, late)
+        });
+        let early: std::time::SystemTime = early.into();
+        assert_eq!(cutoff, early);
+    }
+
+    #[test]
+    fn midnight_cutoff_steps_back_over_a_skipped_day() {
+        // A whole day skipped (DST jump — Pacific/Apia skipped
+        // 2011-12-30): the midnight doesn't exist, so the cutoff falls
+        // back to the previous day's midnight. (The resolver fakes the
+        // skipped day; the fallback probe resolves on the real local
+        // timezone.)
+        let midnight = chrono::NaiveDate::from_ymd_opt(2011, 12, 30)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let mut probes = 0;
+        let cutoff = midnight_cutoff(midnight, &mut |m| {
+            probes += 1;
+            if m == midnight {
+                chrono::LocalResult::None
+            } else {
+                chrono::LocalResult::Single(
+                    chrono::Local
+                        .from_local_datetime(&m)
+                        .earliest()
+                        .expect("a normal local midnight resolves"),
+                )
+            }
+        });
+        assert_eq!(probes, 2, "one step back to the previous midnight");
+        let expected: chrono::DateTime<chrono::Local> = chrono::Local
+            .from_local_datetime(
+                &chrono::NaiveDate::from_ymd_opt(2011, 12, 29)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .expect("the previous midnight exists");
+        let expected: std::time::SystemTime = expected.into();
+        assert_eq!(cutoff, expected);
+    }
+
+    #[test]
     fn filter_entries_applies_text_and_since() {
         use std::time::{Duration, UNIX_EPOCH};
         let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 12, 0, 0).unwrap();
@@ -2540,6 +2863,112 @@ mod tests {
             away_changes: Vec::new(),
             running: true,
         }
+    }
+
+    #[test]
+    fn ctrl_c_quits_like_q() {
+        let mut app = test_app(Vec::new());
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+        assert!(!app.running, "Ctrl+C quits (raw mode eats the tty's SIGINT)");
+        // A plain `c` (no control) must NOT quit.
+        let mut app = test_app(Vec::new());
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::empty(), None);
+        assert!(app.running);
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_while_filtering() {
+        let mut app = test_app(Vec::new());
+        app.filter_active = true;
+        on_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, None);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn ctrl_z_without_a_terminal_is_a_noop() {
+        // The suspend path needs the TUI guard and a foreground pgrp;
+        // with neither (unit tests) it must not stop the process.
+        let mut app = test_app(Vec::new());
+        on_key(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL, None);
+        assert!(app.running);
+    }
+
+    /// A `Write` sink for the Vec-backed terminal in the TermGuard
+    /// tests: the bytes the guard emits on drop land in a shared
+    /// buffer the test can inspect afterwards.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A terminal over a shared in-memory buffer — no tty needed. A
+    /// fixed viewport skips the backend size query (`Terminal::new`
+    /// would ioctl the real terminal).
+    fn buf_terminal(buf: &SharedBuf) -> Term {
+        let writer: Box<dyn std::io::Write> = Box::new(buf.clone());
+        Terminal::with_options(
+            CrosstermBackend::new(writer),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 1, 1)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn term_guard_drop_restores_entered_terminal_state() {
+        // Normal exit: raw mode on, alternate screen entered — Drop
+        // must leave the alternate screen, show the cursor, and stop
+        // mouse/focus reporting (the shell's screen restored).
+        let buf = SharedBuf::default();
+        let guard = TermGuard {
+            term: Some(buf_terminal(&buf)),
+            raw: true,
+            alt: true,
+        };
+        drop(guard);
+        let locked = buf.0.lock().unwrap();
+        let bytes = String::from_utf8_lossy(&locked[..]);
+        assert!(bytes.contains("\x1b[?1049l"), "leaves the alternate screen");
+        assert!(bytes.contains("\x1b[?25h"), "shows the cursor");
+        assert!(bytes.contains("\x1b[?1000l"), "disables mouse capture");
+        assert!(bytes.contains("\x1b[?1004l"), "disables focus reporting");
+    }
+
+    #[test]
+    fn term_guard_drop_is_a_noop_while_a_child_owns_the_terminal() {
+        // open_selection's child window: raw mode off and the alternate
+        // screen left — Drop must not restore anything (the child owns
+        // the terminal; a second teardown would corrupt its screen).
+        let buf = SharedBuf::default();
+        let guard = TermGuard {
+            term: Some(buf_terminal(&buf)),
+            raw: false,
+            alt: false,
+        };
+        drop(guard);
+        assert!(buf.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn term_guard_drop_without_a_terminal_only_disables_raw_mode() {
+        // make_terminal failed: raw mode on but no terminal yet — Drop
+        // must not write anywhere (and must not panic).
+        let guard = TermGuard {
+            term: None,
+            raw: true,
+            alt: false,
+        };
+        drop(guard);
     }
 
     #[test]
