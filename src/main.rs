@@ -12,10 +12,11 @@
 //! (the akapen review-loop flow).
 //!
 //! Away-diff (terminal focus reporting): while the terminal is
-//! unfocused, external edits accumulate in a stack; the listing dims to
-//! gray with the touched files' times in the default fg. On focus
-//! return the touched files flash once, then the display reverts to
-//! normal. Terminals without focus events keep the feature dormant.
+//! unfocused, external edits accumulate in a stack; the rows keep their
+//! normal colors, and only the *untouched* files' times dim — the
+//! touched files' times stay in the usual gray, so freshness reads as
+//! contrast in the time column alone. Focus return reverts instantly
+//! (no flash). Terminals without focus events keep the feature dormant.
 //!
 //! The root resolves from: the positional argument → herdr (`HERDR_ENV=1`
 //! → `herdr worktree list` → `herdr agent list`) → the current directory.
@@ -52,7 +53,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
-use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, to_local};
+use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, is_fresh, to_local};
 use crate::highlight::Highlighter;
 use crate::preview::{Preview, PreviewKey};
 
@@ -75,12 +76,6 @@ const MAX_EVENTS_PER_FRAME: usize = 64;
 const STATUS_SECS: Duration = Duration::from_secs(4);
 /// How often the listing silently refreshes for external changes.
 const REFRESH_TICK: Duration = Duration::from_secs(2);
-/// How long the focus-return flash lasts: the away-changed files blink
-/// (3 on/off cycles), then the listing reverts to normal.
-const FLASH_SECS: Duration = Duration::from_millis(900);
-/// Flash phase cadence (on/off toggle period).
-const FLASH_PHASE: Duration = Duration::from_millis(150);
-
 /// Command-line configuration (spec: 起動 → フラグ).
 struct Config {
     /// Explicit directory argument (spec priority 1); `None` = herdr → cwd.
@@ -467,11 +462,10 @@ struct App {
     /// away-diff feature stays dormant there.
     focused: bool,
     /// Files modified/added while the terminal was unfocused, in
-    /// first-seen order — the "diff stack" of the away period. Shown
-    /// dimmed-mode while away; flashed on focus return, then dropped.
+    /// first-seen order — the "diff stack" of the away period. While
+    /// away, only the *other* files' times dim (the touched times keep
+    /// the normal gray); dropped on focus return.
     away_changes: Vec<PathBuf>,
-    /// End of the focus-return flash window (`None` = no flash).
-    flash_until: Option<Instant>,
     running: bool,
 }
 
@@ -540,25 +534,14 @@ impl App {
     fn focus_lost(&mut self) {
         self.focused = false;
         self.away_changes.clear();
-        self.flash_until = None;
     }
 
-    /// Focus regained: blink the away-diff stack once, then revert to
-    /// the normal listing (the mtime sort already floats the touched
-    /// files to the top, so the flash is the "something changed" cue).
+    /// Focus regained: drop the away stack and revert instantly to the
+    /// normal listing (the mtime sort already floats the touched files
+    /// to the top; no flash — the away display is deliberately quiet).
     fn focus_gained(&mut self) {
         self.focused = true;
-        if !self.away_changes.is_empty() {
-            self.flash_until = Some(Instant::now() + FLASH_SECS);
-        }
-    }
-
-    /// Whether the focus-return flash is in an "on" phase right now
-    /// (the away-changed rows blink until the flash window ends).
-    fn flash_on(&self) -> bool {
-        let Some(until) = self.flash_until else { return false };
-        let left = until.saturating_duration_since(Instant::now());
-        (left.as_millis() / FLASH_PHASE.as_millis()) % 2 == 0
+        self.away_changes.clear();
     }
 
     /// Rebuild `visible` from `files` (filter + clusters), then place the
@@ -1029,7 +1012,6 @@ fn run(config: Config) -> Result<()> {
         bursting: false,
         focused: true,
         away_changes: Vec::new(),
-        flash_until: None,
         running: true,
     };
     // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
@@ -1146,12 +1128,6 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             .is_some_and(|(_, at, _)| at.elapsed() > STATUS_SECS)
         {
             app.status = None;
-        }
-        // The focus-return flash window ended: drop the away stack and
-        // revert to the normal listing.
-        if app.flash_until.is_some_and(|t| Instant::now() >= t) {
-            app.flash_until = None;
-            app.away_changes.clear();
         }
         if !app.running {
             return Ok(());
@@ -1378,7 +1354,6 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
     app.rescan();
     app.focused = true;
     app.away_changes.clear();
-    app.flash_until = None;
     match status {
         Ok(s) if s.success() => app.flash("done — list rescanned"),
         Ok(s) => app.flash_err(format!(
@@ -1543,10 +1518,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (list_area, preview_area, footer_area) = pane_layout(area, preview_on);
     let list_h = list_height(area.height);
     let offset = app.effective_offset(list_h);
-    // Away-diff / focus-return flash: per-row membership is checked in
-    // the row loop, so the path set is built once per frame.
+    // Away-diff: per-row membership is checked in the row loop, so the
+    // path set is built once per frame.
     let away: HashSet<&Path> = app.away_changes.iter().map(|p| p.as_path()).collect();
-    let flash_on = app.flash_on();
 
     // --- left pane: clustered file list -------------------------------
     let mut list_lines: Vec<Line> = Vec::with_capacity(list_h);
@@ -1564,7 +1538,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     for i in offset..offset.saturating_add(list_h).min(app.visible.len()) {
         match &app.visible[i] {
             Row::Separator(c) => {
-                list_lines.push(separator_line(&c.label(now), list_width))
+                list_lines.push(separator_line(&c.label(now), list_width, app.ui_border))
             },
             Row::File(idx) => {
                 let in_away = away.contains(app.files[*idx].path.as_path());
@@ -1575,7 +1549,6 @@ fn draw(f: &mut Frame, app: &mut App) {
                     i == app.cursor,
                     now,
                     in_away,
-                    flash_on && in_away,
                 ));
             }
         }
@@ -1641,12 +1614,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             format!("[away: {} changed]", app.away_changes.len()),
             Style::default().fg(Color::Yellow),
         ));
-    } else if app.flash_until.is_some() {
-        footer1.push(Span::raw(" "));
-        footer1.push(Span::styled(
-            format!("[{} changed since you left]", app.away_changes.len()),
-            Style::default().fg(Color::Yellow),
-        ));
     }
     let footer2 = vec![
         hint("Space", "select"),
@@ -1672,46 +1639,62 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 }
 
+/// Secondary-text style: the terminal's default foreground with the DIM
+/// attribute (SGR 2) — the terminal picks its own "quieter fg", which
+/// tracks the user's palette and stays readable where a hard-coded
+/// bright-black (`DarkGray`) can sink into the background.
+fn dim_style() -> Style {
+    Style::default().add_modifier(Modifier::DIM)
+}
+
 fn hint(key: &str, action: &str) -> Span<'static> {
-    Span::styled(
-        format!("{key}:{action}  "),
-        Style::default().fg(Color::DarkGray),
-    )
+    Span::styled(format!("{key}:{action}  "), dim_style())
 }
 
 fn toggle_span(name: &str, on: bool) -> Span<'static> {
     Span::styled(
         format!("[{name}]"),
-        if on {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        },
+        if on { Style::default() } else { dim_style() },
     )
 }
 
-fn separator_line(label: &str, width: usize) -> Line<'static> {
-    let head = format!("── {label} ");
-    let fill = "─".repeat(width.saturating_sub(files::display_width(&head)));
-    Line::from(Span::styled(
-        format!("{head}{fill}"),
-        Style::default().fg(Color::DarkGray),
-    ))
+/// Cluster header: orientation, not content — the rule rides the
+/// title's border color (same as the outer frame), so the frame and
+/// the clusters read as one structure; the date label is secondary
+/// text (default fg + DIM, the same step as the datetime).
+/// 2026-08-07: the DarkGray+DIM tier and the label's italics were
+/// dropped in stages — first raised to uniform DIM, then the rule
+/// separated onto the border color per the on-screen comparison.
+fn separator_line(label: &str, width: usize, border: Color) -> Line<'static> {
+    let rule_style = Style::default().fg(border);
+    let label_style = dim_style();
+    let head_w = files::display_width(&format!("── {label} "));
+    let fill = "─".repeat(width.saturating_sub(head_w));
+    Line::from(vec![
+        Span::styled("── ", rule_style),
+        Span::styled(format!("{label} "), label_style),
+        Span::styled(fill, rule_style),
+    ])
 }
 
-/// One file row: marker + dir part (dimmed gray) + basename (theme fg,
-/// Cyan on the cursor row) + right-aligned time (gray; `now`/`5m ago`
-/// within 24h, else `HH:MM`; hidden when the name needs the width — the
-/// cluster headers carry the date context, so the name always wins). No
-/// icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
+/// One file row: marker + dir part (border color — same quiet as the
+/// title's frame) + basename (terminal default fg, Cyan on the cursor
+/// row) + right-aligned time (DIM; italic within
+/// the hour — freshness is typography, not color; hidden when the name
+/// needs the width — the cluster headers carry the date context, so the
+/// name always wins). The list respects the terminal palette: default
+/// fg + DIM for secondary text, ANSI accents only (2026-08-07; the
+/// syntect theme fg / RGB ladder experiments were dropped).
+/// No icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
 /// reading is enough, per the spec's no-icon stance). Cursor and
 /// Space-selected rows get the akapen gray background (spec).
 ///
 /// Away-diff mode (terminal unfocused with a non-empty away stack):
-/// every row dims to gray; the touched rows keep a `+` marker and their
-/// time pops in the theme's default fg — the freshness signal while you
-/// watch another pane. On focus return the touched rows flash (yellow
-/// blink, `flash`), then the listing reverts to normal.
+/// the rows keep their normal colors; only the *untouched* files' times
+/// sink further (DarkGray + DIM), so the touched files' times read as
+/// the fresh ones by contrast (2026-08-07: the earlier whole-list dim +
+/// `+` marker + focus-return flash were dropped as too loud). Focus
+/// return reverts instantly.
 fn file_line(
     app: &App,
     idx: usize,
@@ -1719,18 +1702,14 @@ fn file_line(
     is_cursor: bool,
     now: chrono::DateTime<chrono::Local>,
     in_away: bool,
-    flash: bool,
 ) -> Line<'static> {
     let e = &app.files[idx];
     let sel = app.selected.contains(&idx);
     let away_diff = !app.focused && !app.away_changes.is_empty();
     // Cursor/selection: background change only, on the akapen gray.
     // Only the cursor row's *name* gets a Cyan accent (akapen's view
-    // mode); the datetime stays gray — the time is secondary. The
-    // flash overrides everything: whole row yellow/black.
-    let base = if flash {
-        Style::default().bg(Color::Yellow)
-    } else if is_cursor || sel {
+    // mode); the datetime stays gray — the time is secondary.
+    let base = if is_cursor || sel {
         Style::default().bg(app.ui_selected_bg)
     } else {
         Style::default()
@@ -1739,21 +1718,13 @@ fn file_line(
         "> "
     } else if sel {
         "* "
-    } else if away_diff && in_away {
-        "+ "
     } else {
         "  "
     };
-    let fg = app.highlight.default_fg();
-    let name_fg = if flash {
-        Color::Black
-    } else if is_cursor {
-        Color::Cyan
-    } else if away_diff {
-        // Away-diff: everything dims; only the touched rows' time pops.
-        Color::DarkGray
+    let name_style = if is_cursor {
+        base.fg(Color::Cyan)
     } else {
-        fg
+        base // no fg: the terminal's default foreground
     };
     // Split the relative path: the directory part is dimmed, the
     // basename is the star of the row.
@@ -1777,29 +1748,31 @@ fn file_line(
     // At least two columns of gap, or the name butts against the datetime.
     let show_dt = left_w + dt_w + 2 <= avail;
     let pad = avail.saturating_sub(left_w + dt_w);
-    let dir_fg = if flash { Color::Black } else { Color::DarkGray };
-    let dt_fg = if flash {
-        Color::Black
-    } else if away_diff && in_away {
-        fg // the original font color: only the touched files' time pops
-    } else {
-        Color::Gray
-    };
-    let marker_fg = if flash {
-        Color::Black
-    } else if away_diff && in_away {
-        Color::Yellow
-    } else {
-        name_fg
-    };
+    // The time is secondary text (DIM). Freshness (`now`/`Nm ago` —
+    // within the hour) is italic, not a color. Away-diff sinks the
+    // untouched files' times a step further (DarkGray + DIM) so the
+    // touched ones stand out by contrast — the sinking outranks the
+    // fresh cue: it is the whole point.
+    let fresh = is_fresh(now, to_local(e.mtime));
+    let mut dt_style = base.add_modifier(Modifier::DIM);
+    if away_diff && !in_away {
+        dt_style = dt_style.fg(Color::DarkGray);
+    } else if fresh {
+        dt_style = dt_style.add_modifier(Modifier::ITALIC);
+    }
     let mut spans = vec![
-        Span::styled(marker, base.fg(marker_fg)),
-        Span::styled(dir, base.fg(dir_fg)),
-        Span::styled(name, base.fg(name_fg)),
+        Span::styled(marker, name_style),
+        // The dir part is orientation, like the cluster rule: the
+        // border (title) color — the same structural quiet as the
+        // frame. 2026-08-07: raised from DarkGray+DIM (too dim on the
+        // terminal palette) to default+DIM, then to the border color
+        // per the on-screen comparison.
+        Span::styled(dir, base.fg(app.ui_border)),
+        Span::styled(name, name_style),
     ];
     if show_dt {
         spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(dt, base.fg(dt_fg)));
+        spans.push(Span::styled(dt, dt_style));
     }
     Line::from(spans)
 }
@@ -2174,7 +2147,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2234,7 +2206,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2273,7 +2244,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2329,7 +2299,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         };
         // Focused: edits don't accumulate.
@@ -2348,22 +2317,12 @@ mod tests {
         assert_eq!(app.away_changes[1], g);
         app.refresh_if_changed();
         assert_eq!(app.away_changes.len(), 2, "no double-count on rescan");
-        // Back: the flash arms, and its expiry reverts to the normal listing.
+        // Back: the stack drops instantly — no flash, straight to normal.
         app.focus_gained();
         assert!(
-            app.flash_until.is_some(),
-            "focus return arms the flash when the stack is non-empty"
+            app.away_changes.is_empty(),
+            "focus return drops the away stack immediately"
         );
-        app.flash_until = Some(Instant::now() - Duration::from_millis(1));
-        if app.flash_until.is_some_and(|t| Instant::now() >= t) {
-            app.flash_until = None;
-            app.away_changes.clear();
-        }
-        assert!(app.away_changes.is_empty(), "flash expiry drops the away stack");
-        // Focus return with an empty stack: no flash.
-        app.focus_lost();
-        app.focus_gained();
-        assert!(app.flash_until.is_none(), "nothing to flash");
     }
 
     #[test]
@@ -2396,7 +2355,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         };
         // 10 file rows, 5 visible; cursor at 9.
@@ -2476,7 +2434,6 @@ mod tests {
             bursting: false,
             focused: true,
             away_changes: Vec::new(),
-            flash_until: None,
             running: true,
         }
     }

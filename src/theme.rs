@@ -42,6 +42,7 @@ pub fn border_color(light: bool) -> Color {
     if light { BORDER_LIGHT } else { BORDER_DARK }
 }
 
+
 /// Ask the terminal for its background color and decide light/dark.
 /// `None` = unknown (no tty, no answer, unparseable) — the caller falls
 /// back to dark.
@@ -271,4 +272,5 @@ mod tests {
         assert_eq!(border_color(false), Color::Rgb(127, 132, 156));
         assert_eq!(border_color(true), Color::Rgb(180, 180, 190));
     }
+
 }
