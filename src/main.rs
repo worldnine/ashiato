@@ -53,7 +53,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
-use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, to_local};
+use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, is_fresh, to_local};
 use crate::highlight::Highlighter;
 use crate::preview::{Preview, PreviewKey};
 
@@ -1667,9 +1667,10 @@ fn separator_line(label: &str, width: usize) -> Line<'static> {
 }
 
 /// One file row: marker + dir part (dimmed gray) + basename (theme fg,
-/// Cyan on the cursor row) + right-aligned time (gray; `now`/`5m ago`
-/// within the hour, else `HH:MM`; hidden when the name needs the width —
-/// the cluster headers carry the date context, so the name always wins).
+/// Cyan on the cursor row) + right-aligned time (`now`/`5m ago` in the
+/// fresh accent within the hour, else `HH:MM` in gray; hidden when the
+/// name needs the width — the cluster headers carry the date context,
+/// so the name always wins).
 /// No icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
 /// reading is enough, per the spec's no-icon stance). Cursor and
 /// Space-selected rows get the akapen gray background (spec).
@@ -1730,10 +1731,15 @@ fn file_line(
     // At least two columns of gap, or the name butts against the datetime.
     let show_dt = left_w + dt_w + 2 <= avail;
     let pad = avail.saturating_sub(left_w + dt_w);
-    // Away-diff: the untouched files' times drop to dark gray so the
-    // touched files' (normal gray) times stand out by contrast.
+    // Away-diff sinks the untouched files' times to dark gray so the
+    // touched files' times stand out by contrast; that dimming outranks
+    // the fresh accent (sinking is the whole point). Otherwise the
+    // relative window (`now`/`Nm ago` — within the hour) gets the fresh
+    // accent so the hot rows read at a glance.
     let dt_fg = if away_diff && !in_away {
         Color::DarkGray
+    } else if is_fresh(now, to_local(e.mtime)) {
+        Color::Yellow
     } else {
         Color::Gray
     };

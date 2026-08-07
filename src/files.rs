@@ -195,6 +195,13 @@ pub fn format_time(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> 
     }
 }
 
+/// Whether `t` falls in [`format_time`]'s relative window (`now`/`Nm ago`,
+/// i.e. touched within the hour) — the rows whose time gets the fresh
+/// accent color. Kept next to `format_time` so the two share one boundary.
+pub fn is_fresh(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> bool {
+    now.signed_duration_since(t) < chrono::Duration::minutes(60)
+}
+
 /// Case-insensitive substring match on the relative path. A leading `/` in
 /// the filter is stripped so the spec's examples work: `/main.rs` matches
 /// `src/main.rs`, `/src/` matches `src/…` paths, `/.md` matches `.md`
@@ -400,6 +407,17 @@ mod tests {
         assert_eq!(format_time(n, n - chrono::Duration::hours(23)), "15:00");
         assert_eq!(format_time(n, n - chrono::Duration::hours(24)), "14:00");
         assert_eq!(format_time(n, local(2026, 8, 3, 9, 5)), "09:05");
+    }
+
+    #[test]
+    fn is_fresh_matches_format_time_relative_window() {
+        let n = now();
+        // The fresh window is exactly the now/Nm-ago window: < 60 minutes
+        // elapsed, future timestamps (clock skew) included.
+        assert!(is_fresh(n, n + chrono::Duration::hours(1)));
+        assert!(is_fresh(n, n - chrono::Duration::minutes(59)));
+        assert!(!is_fresh(n, n - chrono::Duration::minutes(60)));
+        assert!(!is_fresh(n, n - chrono::Duration::hours(24)));
     }
 
     #[test]

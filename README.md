@@ -63,6 +63,8 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 
 The list rescans every 2 seconds; when an agent edits files in another pane, they float up live. Cursor and selection follow by path.
 
+Times are relative within the hour (`now`, `5m ago`) and shown in a yellow accent; anything older shows plain `HH:MM` in gray — "ago" appearing at all means "touched within the hour".
+
 ### Away-diff (terminal focus)
 
 ashiato tracks terminal focus via xterm focus reporting (DECSET 1004; kitty, WezTerm, Ghostty, alacritty, xterm, Terminal.app, iTerm2, Windows Terminal; tmux needs `focus-events on`). Terminals that never emit focus events simply keep the feature dormant.
