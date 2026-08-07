@@ -949,6 +949,22 @@ fn make_terminal() -> Result<Term> {
     Ok(Terminal::new(CrosstermBackend::new(writer))?)
 }
 
+/// Enter the TUI terminal modes: alternate screen, hidden cursor, mouse
+/// capture — and focus reporting. Used on startup and again when the TUI
+/// comes back after a child process (akapen, vim, …) exits. The child is
+/// usually a crossterm app too, and its teardown sends
+/// `DisableFocusChange`; without the re-send, the away-diff feature
+/// (external edits while the terminal is unfocused) would stay dead for
+/// the rest of the session.
+fn enter_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    use ratatui::crossterm::QueueableCommand;
+    w.queue(EnterAlternateScreen)?;
+    w.queue(Hide)?;
+    w.queue(EnableMouseCapture)?;
+    w.queue(EnableFocusChange)?;
+    w.flush()
+}
+
 /// When stdin is not a terminal (xargs gives children /dev/null; scripts
 /// redirect it), rebind fd 0 to a real tty so crossterm's event reader
 /// can initialize. On macOS this must be the actual pty slave: /dev/tty
@@ -1071,6 +1087,22 @@ fn run(config: Config) -> Result<()> {
     app.sort = app.config.sort;
     app.show_hidden = app.config.show_hidden;
     app.show_dirs = app.config.show_dirs;
+    let mut terminal = match make_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            // Raw mode is already on: restore it before bailing, or the
+            // user's shell is left in raw mode.
+            let _ = ratatui::crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
+    };
+    let _ = enter_tui_modes(terminal.backend_mut());
+    // The first scan blocks the event loop — on a huge tree it takes
+    // seconds, and with the alternate screen already up that reads as a
+    // frozen/black screen. Draw a "scanning" status before the scan;
+    // event_loop's opening draw renders the result the moment it returns.
+    app.flash("scanning…");
+    terminal.draw(|f| draw(f, &mut app))?;
     // The `--filter`/`--since` seeds apply to the first scan; `/` edits
     // the filter later.
     app.filter = app.config.filter.clone();
@@ -1081,24 +1113,10 @@ fn run(config: Config) -> Result<()> {
         if !failed {
             app.flash("no files found");
         }
+    } else {
+        // The scan is done and the listing is live: drop the placeholder.
+        app.status = None;
     }
-
-    let mut terminal = match make_terminal() {
-        Ok(t) => t,
-        Err(e) => {
-            // Raw mode is already on: restore it before bailing, or the
-            // user's shell is left in raw mode.
-            let _ = ratatui::crossterm::terminal::disable_raw_mode();
-            return Err(e);
-        }
-    };
-    let _ = execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        Hide,
-        EnableMouseCapture,
-        EnableFocusChange
-    );
     let res = event_loop(&mut terminal, &mut app);
     let _ = execute!(
         terminal.backend_mut(),
@@ -1380,16 +1398,29 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
     let status = Command::new("sh").arg("-c").arg(&cmd).status();
     // Re-enter raw mode and rebuild a fresh terminal for the TUI.
     let _ = ratatui::crossterm::terminal::enable_raw_mode();
-    if let Some(t) = terminal {
+    if let Some(t) = terminal.as_deref_mut() {
         match make_terminal() {
             Ok(term) => {
                 *t = term;
-                let _ = execute!(t.backend_mut(), EnterAlternateScreen, Hide, EnableMouseCapture);
+                // Re-send focus reporting along with the screen re-entry:
+                // the child may have sent DisableFocusChange on its way
+                // out, which would kill the away-diff silently.
+                let _ = enter_tui_modes(t.backend_mut());
             }
             Err(e) => {
                 app.flash_err(format!("terminal restore failed: {e:#}"));
                 app.running = false;
             }
+        }
+    }
+    // The rescan below blocks the event loop — on a huge tree it takes
+    // seconds, and the freshly entered alternate screen is still blank:
+    // draw a "scanning" status first. (The post-scan frame is drawn via
+    // needs_immediate_redraw when the event loop resumes.)
+    if app.running {
+        app.flash("scanning…");
+        if let Some(t) = terminal {
+            let _ = t.draw(|f| draw(f, app));
         }
     }
     // The child may have edited files: rescan so fresh mtimes float up
@@ -2651,5 +2682,53 @@ mod tests {
         scroll_view(&mut app, -1, 5);
         assert_eq!(app.offset, 4);
         assert_eq!(app.cursor, 8, "cursor snaps to the window's last row");
+    }
+
+    #[test]
+    fn enter_tui_modes_re_enables_focus_reporting() {
+        // 子プロセス（akapen/vim 等の crossterm 系）は終了時に
+        // DisableFocusChange を送り得るため、TUI 復帰時にもフォーカス
+        // レポートを有効化し直す必要がある。欠けると away-diff が
+        // セッション中ずっと無効化されたままになる（回帰防止: 復帰時の
+        // 再送に EnableFocusChange が含まれていることを ANSI で検証）。
+        let mut out = Vec::new();
+        enter_tui_modes(&mut out).unwrap();
+        let ansi = String::from_utf8(out).unwrap();
+        assert!(ansi.contains("\x1b[?1004h"), "EnableFocusChange missing: {ansi:?}");
+        assert!(ansi.contains("\x1b[?1049h"), "EnterAlternateScreen missing: {ansi:?}");
+        assert!(ansi.contains("\x1b[?25l"), "Hide missing: {ansi:?}");
+        assert!(ansi.contains("\x1b[?1000h"), "EnableMouseCapture missing: {ansi:?}");
+    }
+
+    #[test]
+    fn open_selection_rescans_and_reports_done_after_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "1").unwrap();
+        std::fs::write(dir.path().join("b.md"), "2").unwrap();
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.config.open_cmd = Some("true".to_string());
+        app.rescan();
+        // The child (simulated: `true`) edits the tree while the TUI is
+        // suspended; the post-exit rescan must pick the new file up, and
+        // the "scanning…" placeholder must give way to the done message.
+        let c = dir.path().join("c.md");
+        std::fs::write(&c, "3").unwrap();
+        app.focused = false;
+        app.away_changes = vec![c.clone()];
+        open_selection(&mut app, None);
+        assert!(
+            app.files.iter().any(|e| e.path == c),
+            "rescan after the child exit picks up external edits"
+        );
+        assert_eq!(
+            app.status.as_ref().map(|(m, _, err)| (m.as_str(), *err)),
+            Some(("done — list rescanned", false))
+        );
+        // The child owned the terminal: we are focused again and the
+        // stale away stack must not flip the away-diff on.
+        assert!(app.focused);
+        assert!(app.away_changes.is_empty());
+        assert!(app.running);
     }
 }
