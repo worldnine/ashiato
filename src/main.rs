@@ -547,18 +547,41 @@ impl App {
                 files::sort_entries(&mut entries, self.sort);
                 self.commit_scan(entries);
             }
-            Err(e) => self.flash_err(format!("rescan failed: {e:#}")),
+            Err(e) => {
+                // Same root-gone rule as refresh_if_changed: a deleted
+                // root must not freeze the stale listing.
+                let root_gone = std::fs::metadata(&self.root)
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+                if root_gone && !self.files.is_empty() {
+                    self.commit_scan(Vec::new());
+                }
+                self.flash_err(format!("rescan failed: {e:#}"));
+            }
         }
     }
 
     /// Periodic silent refresh: re-scan and commit only when the listing
     /// actually changed (an agent editing files while ashiato is open
     /// floats the touched files up on its own — the preview cache and
-    /// cursor/selection survive when nothing changed).
+    /// cursor/selection survive when nothing changed). A scan error is
+    /// normally transient and therefore silent — except when the root
+    /// itself is gone: the stale listing must not linger, so it is
+    /// replaced with an empty one and the user is told once.
     fn refresh_if_changed(&mut self) {
         let started = Instant::now();
-        let Ok(mut entries) = files::scan(&self.root, self.show_hidden, self.show_dirs) else {
-            return; // transient scan errors are silent here
+        let mut entries = match files::scan(&self.root, self.show_hidden, self.show_dirs) {
+            Ok(entries) => entries,
+            Err(_) => {
+                // NotFound only: a permission blip must not wipe the
+                // listing, but a deleted root has no files left to show.
+                let root_gone = std::fs::metadata(&self.root)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                if root_gone && !self.files.is_empty() {
+                    self.commit_scan(Vec::new());
+                    self.flash_err(format!("root deleted: {}", self.root.display()));
+                }
+                return;
+            }
         };
         files::sort_entries(&mut entries, self.sort);
         // The scan blocks the event loop: after a slow one (huge tree),
@@ -1959,6 +1982,56 @@ mod tests {
         };
         app.rebuild_visible(None);
         assert_eq!(app.visible_count(), 1, "--since 1d keeps only the fresh file");
+    }
+
+    #[test]
+    fn refresh_clears_the_listing_when_the_root_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let mut app = App {
+            config: run_config(&[]),
+            root: dir.path().to_path_buf(),
+            files: files::scan(dir.path(), false, false).unwrap(),
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: String::new(),
+            filter_on: true,
+            since: None,
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            running: true,
+        };
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 1);
+        // Unchanged listing: no commit, no status message.
+        app.refresh_if_changed();
+        assert_eq!(app.files.len(), 1);
+        assert!(app.status.is_none());
+        // Delete the root: the stale listing must not linger.
+        drop(dir);
+        app.refresh_if_changed();
+        assert!(app.files.is_empty(), "a deleted root empties the listing");
+        assert!(
+            app.status.as_ref().is_some_and(|(_, _, err)| *err),
+            "the user is told the root is gone"
+        );
+        // Already empty: no repeated alert on every tick.
+        app.status = None;
+        app.refresh_if_changed();
+        assert!(app.status.is_none(), "no repeated alerts");
     }
 
     #[test]
