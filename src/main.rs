@@ -352,7 +352,7 @@ fn main() -> Result<()> {
                  \x20 --show-dirs    show directories on startup (d toggles)\n\
                  \x20 --open-cmd <command> Enter spawns this with the selected files\n\
                  \x20                   (none by default — Enter prints the paths to\n\
-                 \x20                   stdout and exits; {{}} = all paths, {{1}}.. per-file)\n\
+                 \x20                   stdout and exits; {} = all paths, {1}.. per-file)\n\
                  \x20 --filter <text>   initial filter (same matching as `/`,\n\
                  \x20                   e.g. `.md` for markdown only)\n\
                  \x20 --preview <on|off|auto>  preview pane (default auto:\n\
@@ -1935,7 +1935,7 @@ mod tests {
             expand_cmd("vim -p {1} {2}", &paths),
             "vim -p '/a/one.md' '/b/two.md'"
         );
-        // No indexed placeholder and no `{{}}` → paths appended.
+        // No indexed placeholder and no `{}` → paths appended.
         assert_eq!(
             expand_cmd("x {3}", &paths),
             "x {3} '/a/one.md' '/b/two.md'"
@@ -1946,6 +1946,17 @@ mod tests {
         assert_eq!(
             expand_cmd("awk '{print}'", &paths),
             "awk '{print}' '/a/one.md' '/b/two.md'"
+        );
+        // Doubled braces (`{{}}` / `{{1}}`) are not a placeholder form:
+        // the help text documents `{}` / `{1}`, so they stay literal
+        // and the paths are appended.
+        assert_eq!(
+            expand_cmd("vim {{}}", &paths),
+            "vim {{}} '/a/one.md' '/b/two.md'"
+        );
+        assert_eq!(
+            expand_cmd("vim {{1}}", &paths),
+            "vim {{1}} '/a/one.md' '/b/two.md'"
         );
     }
 
