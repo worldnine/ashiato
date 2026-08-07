@@ -1538,7 +1538,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     for i in offset..offset.saturating_add(list_h).min(app.visible.len()) {
         match &app.visible[i] {
             Row::Separator(c) => {
-                list_lines.push(separator_line(&c.label(now), list_width))
+                list_lines.push(separator_line(&c.label(now), list_width, app.ui_border))
             },
             Row::File(idx) => {
                 let in_away = away.contains(app.files[*idx].path.as_path());
@@ -1658,24 +1658,28 @@ fn toggle_span(name: &str, on: bool) -> Span<'static> {
     )
 }
 
-/// Cluster header: orientation, not content — secondary text (default
-/// fg + DIM, the same step as the datetime). The date label rides the
-/// rule line unstyled (2026-08-07: the nearly-invisible DarkGray+DIM
-/// tier and the label's italics were dropped — one uniform quiet line,
-/// per the on-screen brightness test).
-fn separator_line(label: &str, width: usize) -> Line<'static> {
-    let style = dim_style();
+/// Cluster header: orientation, not content — the rule rides the
+/// title's border color (same as the outer frame), so the frame and
+/// the clusters read as one structure; the date label is secondary
+/// text (default fg + DIM, the same step as the datetime).
+/// 2026-08-07: the DarkGray+DIM tier and the label's italics were
+/// dropped in stages — first raised to uniform DIM, then the rule
+/// separated onto the border color per the on-screen comparison.
+fn separator_line(label: &str, width: usize, border: Color) -> Line<'static> {
+    let rule_style = Style::default().fg(border);
+    let label_style = dim_style();
     let head_w = files::display_width(&format!("── {label} "));
     let fill = "─".repeat(width.saturating_sub(head_w));
     Line::from(vec![
-        Span::styled("── ", style),
-        Span::styled(format!("{label} "), style),
-        Span::styled(fill, style),
+        Span::styled("── ", rule_style),
+        Span::styled(format!("{label} "), label_style),
+        Span::styled(fill, rule_style),
     ])
 }
 
-/// One file row: marker + dir part (DIM) + basename (terminal default
-/// fg, Cyan on the cursor row) + right-aligned time (DIM; italic within
+/// One file row: marker + dir part (border color — same quiet as the
+/// title's frame) + basename (terminal default fg, Cyan on the cursor
+/// row) + right-aligned time (DIM; italic within
 /// the hour — freshness is typography, not color; hidden when the name
 /// needs the width — the cluster headers carry the date context, so the
 /// name always wins). The list respects the terminal palette: default
@@ -1758,11 +1762,12 @@ fn file_line(
     }
     let mut spans = vec![
         Span::styled(marker, name_style),
-        // The dir part is orientation, like the cluster rule: secondary
-        // (default fg + DIM). It must stay readable — 2026-08-07: the
-        // DarkGray+DIM "nearly out" tier was too dim on the terminal's
-        // palette, so it was raised to the same step as the datetime.
-        Span::styled(dir, base.add_modifier(Modifier::DIM)),
+        // The dir part is orientation, like the cluster rule: the
+        // border (title) color — the same structural quiet as the
+        // frame. 2026-08-07: raised from DarkGray+DIM (too dim on the
+        // terminal palette) to default+DIM, then to the border color
+        // per the on-screen comparison.
+        Span::styled(dir, base.fg(app.ui_border)),
         Span::styled(name, name_style),
     ];
     if show_dt {
