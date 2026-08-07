@@ -11,6 +11,12 @@
 //! model); with it, Enter launches the command, blocks, and rescans
 //! (the akapen review-loop flow).
 //!
+//! Away-diff (terminal focus reporting): while the terminal is
+//! unfocused, external edits accumulate in a stack; the listing dims to
+//! gray with the touched files' times in the default fg. On focus
+//! return the touched files flash once, then the display reverts to
+//! normal. Terminals without focus events keep the feature dormant.
+//!
 //! The root resolves from: the positional argument → herdr (`HERDR_ENV=1`
 //! → `herdr worktree list` → `herdr agent list`) → the current directory.
 //!
@@ -24,7 +30,7 @@ mod highlight;
 mod preview;
 mod theme;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -35,8 +41,8 @@ use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -69,6 +75,11 @@ const MAX_EVENTS_PER_FRAME: usize = 64;
 const STATUS_SECS: Duration = Duration::from_secs(4);
 /// How often the listing silently refreshes for external changes.
 const REFRESH_TICK: Duration = Duration::from_secs(2);
+/// How long the focus-return flash lasts: the away-changed files blink
+/// (3 on/off cycles), then the listing reverts to normal.
+const FLASH_SECS: Duration = Duration::from_millis(900);
+/// Flash phase cadence (on/off toggle period).
+const FLASH_PHASE: Duration = Duration::from_millis(150);
 
 /// Command-line configuration (spec: 起動 → フラグ).
 struct Config {
@@ -451,6 +462,16 @@ struct App {
     /// instead of re-rendering per key (speed first; see
     /// [`App::preview_lines`]).
     bursting: bool,
+    /// Terminal keyboard focus (xterm focus reporting `CSI ? 1004h`).
+    /// Terminals that don't emit focus events never flip this, so the
+    /// away-diff feature stays dormant there.
+    focused: bool,
+    /// Files modified/added while the terminal was unfocused, in
+    /// first-seen order — the "diff stack" of the away period. Shown
+    /// dimmed-mode while away; flashed on focus return, then dropped.
+    away_changes: Vec<PathBuf>,
+    /// End of the focus-return flash window (`None` = no flash).
+    flash_until: Option<Instant>,
     running: bool,
 }
 
@@ -512,6 +533,32 @@ impl App {
         let _ = out.write_all(b"\x07");
         let _ = out.flush();
         self.status = Some((msg.into(), Instant::now(), true));
+    }
+
+    /// Focus lost: start a fresh away-diff stack — only the changes
+    /// made while unfocused are reported on return.
+    fn focus_lost(&mut self) {
+        self.focused = false;
+        self.away_changes.clear();
+        self.flash_until = None;
+    }
+
+    /// Focus regained: blink the away-diff stack once, then revert to
+    /// the normal listing (the mtime sort already floats the touched
+    /// files to the top, so the flash is the "something changed" cue).
+    fn focus_gained(&mut self) {
+        self.focused = true;
+        if !self.away_changes.is_empty() {
+            self.flash_until = Some(Instant::now() + FLASH_SECS);
+        }
+    }
+
+    /// Whether the focus-return flash is in an "on" phase right now
+    /// (the away-changed rows blink until the flash window ends).
+    fn flash_on(&self) -> bool {
+        let Some(until) = self.flash_until else { return false };
+        let left = until.saturating_duration_since(Instant::now());
+        (left.as_millis() / FLASH_PHASE.as_millis()) % 2 == 0
     }
 
     /// Rebuild `visible` from `files` (filter + clusters), then place the
@@ -597,6 +644,17 @@ impl App {
             }
         };
         files::sort_entries(&mut entries, self.sort);
+        // Away-diff: while the terminal is unfocused, external edits
+        // accumulate in `away_changes` (deduped, first-seen order) so
+        // the listing can dim everything but the touched files, and
+        // focus return can flash them.
+        if !self.focused {
+            for p in files::changed_paths(&self.files, &entries) {
+                if !self.away_changes.contains(&p) {
+                    self.away_changes.push(p);
+                }
+            }
+        }
         // The scan blocks the event loop: after a slow one (huge tree),
         // back off to a ~10% duty cycle instead of freezing every tick.
         self.refresh_every = REFRESH_TICK.max(started.elapsed() * 10);
@@ -969,6 +1027,9 @@ fn run(config: Config) -> Result<()> {
         refresh_every: REFRESH_TICK,
         last_input: Instant::now(),
         bursting: false,
+        focused: true,
+        away_changes: Vec::new(),
+        flash_until: None,
         running: true,
     };
     // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
@@ -997,9 +1058,21 @@ fn run(config: Config) -> Result<()> {
             return Err(e);
         }
     };
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, Hide, EnableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        Hide,
+        EnableMouseCapture,
+        EnableFocusChange
+    );
     let res = event_loop(&mut terminal, &mut app);
-    let _ = execute!(terminal.backend_mut(), Show, DisableMouseCapture, LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableFocusChange
+    );
     let _ = ratatui::crossterm::terminal::disable_raw_mode();
     // `--output` mode: the paths print only after the TUI is fully down,
     // to the (piped) stdout — the TUI rendered on /dev/tty, so the pipe
@@ -1048,6 +1121,8 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                         any_input = true;
                         on_mouse(app, mouse);
                     }
+                    Event::FocusGained => app.focus_gained(),
+                    Event::FocusLost => app.focus_lost(),
                     _ => {}
                 }
             }
@@ -1071,6 +1146,12 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
             .is_some_and(|(_, at, _)| at.elapsed() > STATUS_SECS)
         {
             app.status = None;
+        }
+        // The focus-return flash window ended: drop the away stack and
+        // revert to the normal listing.
+        if app.flash_until.is_some_and(|t| Instant::now() >= t) {
+            app.flash_until = None;
+            app.away_changes.clear();
         }
         if !app.running {
             return Ok(());
@@ -1292,8 +1373,12 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut Term>) {
         }
     }
     // The child may have edited files: rescan so fresh mtimes float up
-    // (spec flow step 4-5).
+    // (spec flow step 4-5). The child owned the terminal, so we are
+    // focused again — a stale focus event must not flip the away-diff on.
     app.rescan();
+    app.focused = true;
+    app.away_changes.clear();
+    app.flash_until = None;
     match status {
         Ok(s) if s.success() => app.flash("done — list rescanned"),
         Ok(s) => app.flash_err(format!(
@@ -1458,6 +1543,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (list_area, preview_area, footer_area) = pane_layout(area, preview_on);
     let list_h = list_height(area.height);
     let offset = app.effective_offset(list_h);
+    // Away-diff / focus-return flash: per-row membership is checked in
+    // the row loop, so the path set is built once per frame.
+    let away: HashSet<&Path> = app.away_changes.iter().map(|p| p.as_path()).collect();
+    let flash_on = app.flash_on();
 
     // --- left pane: clustered file list -------------------------------
     let mut list_lines: Vec<Line> = Vec::with_capacity(list_h);
@@ -1478,7 +1567,16 @@ fn draw(f: &mut Frame, app: &mut App) {
                 list_lines.push(separator_line(&c.label(now), list_width))
             },
             Row::File(idx) => {
-                list_lines.push(file_line(app, *idx, list_width, i == app.cursor, now));
+                let in_away = away.contains(app.files[*idx].path.as_path());
+                list_lines.push(file_line(
+                    app,
+                    *idx,
+                    list_width,
+                    i == app.cursor,
+                    now,
+                    in_away,
+                    flash_on && in_away,
+                ));
             }
         }
     }
@@ -1534,6 +1632,19 @@ fn draw(f: &mut Frame, app: &mut App) {
         footer1.push(Span::raw(" "));
         footer1.push(Span::styled(
             format!("[selected:{}]", app.selected.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !app.focused && !app.away_changes.is_empty() {
+        footer1.push(Span::raw(" "));
+        footer1.push(Span::styled(
+            format!("[away: {} changed]", app.away_changes.len()),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if app.flash_until.is_some() {
+        footer1.push(Span::raw(" "));
+        footer1.push(Span::styled(
+            format!("[{} changed since you left]", app.away_changes.len()),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -1595,26 +1706,55 @@ fn separator_line(label: &str, width: usize) -> Line<'static> {
 /// icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
 /// reading is enough, per the spec's no-icon stance). Cursor and
 /// Space-selected rows get the akapen gray background (spec).
+///
+/// Away-diff mode (terminal unfocused with a non-empty away stack):
+/// every row dims to gray; the touched rows keep a `+` marker and their
+/// time pops in the theme's default fg — the freshness signal while you
+/// watch another pane. On focus return the touched rows flash (yellow
+/// blink, `flash`), then the listing reverts to normal.
 fn file_line(
     app: &App,
     idx: usize,
     width: usize,
     is_cursor: bool,
     now: chrono::DateTime<chrono::Local>,
+    in_away: bool,
+    flash: bool,
 ) -> Line<'static> {
     let e = &app.files[idx];
     let sel = app.selected.contains(&idx);
+    let away_diff = !app.focused && !app.away_changes.is_empty();
     // Cursor/selection: background change only, on the akapen gray.
     // Only the cursor row's *name* gets a Cyan accent (akapen's view
-    // mode); the datetime stays gray — the time is secondary.
-    let base = if is_cursor || sel {
+    // mode); the datetime stays gray — the time is secondary. The
+    // flash overrides everything: whole row yellow/black.
+    let base = if flash {
+        Style::default().bg(Color::Yellow)
+    } else if is_cursor || sel {
         Style::default().bg(app.ui_selected_bg)
     } else {
         Style::default()
     };
-    let marker = if is_cursor { "> " } else if sel { "* " } else { "  " };
+    let marker = if is_cursor {
+        "> "
+    } else if sel {
+        "* "
+    } else if away_diff && in_away {
+        "+ "
+    } else {
+        "  "
+    };
     let fg = app.highlight.default_fg();
-    let name_fg = if is_cursor { Color::Cyan } else { fg };
+    let name_fg = if flash {
+        Color::Black
+    } else if is_cursor {
+        Color::Cyan
+    } else if away_diff {
+        // Away-diff: everything dims; only the touched rows' time pops.
+        Color::DarkGray
+    } else {
+        fg
+    };
     // Split the relative path: the directory part is dimmed, the
     // basename is the star of the row.
     let rel = e.display_rel();
@@ -1637,14 +1777,29 @@ fn file_line(
     // At least two columns of gap, or the name butts against the datetime.
     let show_dt = left_w + dt_w + 2 <= avail;
     let pad = avail.saturating_sub(left_w + dt_w);
+    let dir_fg = if flash { Color::Black } else { Color::DarkGray };
+    let dt_fg = if flash {
+        Color::Black
+    } else if away_diff && in_away {
+        fg // the original font color: only the touched files' time pops
+    } else {
+        Color::Gray
+    };
+    let marker_fg = if flash {
+        Color::Black
+    } else if away_diff && in_away {
+        Color::Yellow
+    } else {
+        name_fg
+    };
     let mut spans = vec![
-        Span::styled(marker, base.fg(name_fg)),
-        Span::styled(dir, base.fg(Color::DarkGray)),
+        Span::styled(marker, base.fg(marker_fg)),
+        Span::styled(dir, base.fg(dir_fg)),
         Span::styled(name, base.fg(name_fg)),
     ];
     if show_dt {
         spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(dt, base.fg(Color::Gray)));
+        spans.push(Span::styled(dt, base.fg(dt_fg)));
     }
     Line::from(spans)
 }
@@ -2017,6 +2172,9 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2074,6 +2232,9 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2110,6 +2271,9 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2130,6 +2294,76 @@ mod tests {
         app.status = None;
         app.refresh_if_changed();
         assert!(app.status.is_none(), "no repeated alerts");
+    }
+
+    #[test]
+    fn away_diff_accumulates_while_unfocused_then_flashes_and_reverts() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, "v1").unwrap();
+        let mut app = App {
+            config: run_config(&[]),
+            root: dir.path().to_path_buf(),
+            files: files::scan(dir.path(), false, false).unwrap(),
+            visible: Vec::new(),
+            cursor: 0,
+            offset: 0,
+            selected: BTreeSet::new(),
+            filter: String::new(),
+            filter_on: true,
+            since: None,
+            filter_active: false,
+            sort: Sort::MtimeDesc,
+            show_hidden: false,
+            show_dirs: false,
+            highlight: Highlighter::new(None, false),
+            ui_selected_bg: theme::selected_bg(false),
+            ui_border: theme::border_color(false),
+            preview_cache: None,
+            status: None,
+            pending_output: None,
+            needs_immediate_redraw: false,
+            last_refresh: Instant::now(),
+            refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
+            running: true,
+        };
+        // Focused: edits don't accumulate.
+        std::fs::write(&f, "v2").unwrap();
+        app.refresh_if_changed();
+        assert!(app.away_changes.is_empty(), "focused edits are not away-changes");
+        // Away: edits stack up, deduped, in first-seen order.
+        app.focus_lost();
+        std::fs::write(&f, "v3").unwrap();
+        app.refresh_if_changed();
+        let g = dir.path().join("b.txt");
+        std::fs::write(&g, "x").unwrap();
+        app.refresh_if_changed();
+        assert_eq!(app.away_changes.len(), 2, "two files changed while away");
+        assert_eq!(app.away_changes[0], f);
+        assert_eq!(app.away_changes[1], g);
+        app.refresh_if_changed();
+        assert_eq!(app.away_changes.len(), 2, "no double-count on rescan");
+        // Back: the flash arms, and its expiry reverts to the normal listing.
+        app.focus_gained();
+        assert!(
+            app.flash_until.is_some(),
+            "focus return arms the flash when the stack is non-empty"
+        );
+        app.flash_until = Some(Instant::now() - Duration::from_millis(1));
+        if app.flash_until.is_some_and(|t| Instant::now() >= t) {
+            app.flash_until = None;
+            app.away_changes.clear();
+        }
+        assert!(app.away_changes.is_empty(), "flash expiry drops the away stack");
+        // Focus return with an empty stack: no flash.
+        app.focus_lost();
+        app.focus_gained();
+        assert!(app.flash_until.is_none(), "nothing to flash");
     }
 
     #[test]
@@ -2160,6 +2394,9 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
             running: true,
         };
         // 10 file rows, 5 visible; cursor at 9.
@@ -2237,6 +2474,9 @@ mod tests {
             refresh_every: REFRESH_TICK,
             last_input: Instant::now(),
             bursting: false,
+            focused: true,
+            away_changes: Vec::new(),
+            flash_until: None,
             running: true,
         }
     }
