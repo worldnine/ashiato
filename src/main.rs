@@ -1658,18 +1658,19 @@ fn toggle_span(name: &str, on: bool) -> Span<'static> {
     )
 }
 
-/// Cluster header: orientation, not content — the whole line fades
-/// almost out (bright-black + DIM), the date label distinguished only
-/// by its italics.
+/// Cluster header: orientation, not content — secondary text (default
+/// fg + DIM, the same step as the datetime). The date label rides the
+/// rule line unstyled (2026-08-07: the nearly-invisible DarkGray+DIM
+/// tier and the label's italics were dropped — one uniform quiet line,
+/// per the on-screen brightness test).
 fn separator_line(label: &str, width: usize) -> Line<'static> {
-    let rule_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
-    let label_style = rule_style.add_modifier(Modifier::ITALIC);
+    let style = dim_style();
     let head_w = files::display_width(&format!("── {label} "));
     let fill = "─".repeat(width.saturating_sub(head_w));
     Line::from(vec![
-        Span::styled("── ", rule_style),
-        Span::styled(format!("{label} "), label_style),
-        Span::styled(fill, rule_style),
+        Span::styled("── ", style),
+        Span::styled(format!("{label} "), style),
+        Span::styled(fill, style),
     ])
 }
 
@@ -1757,8 +1758,11 @@ fn file_line(
     }
     let mut spans = vec![
         Span::styled(marker, name_style),
-        // The dir part is orientation, like the cluster rule: nearly out.
-        Span::styled(dir, base.fg(Color::DarkGray).add_modifier(Modifier::DIM)),
+        // The dir part is orientation, like the cluster rule: secondary
+        // (default fg + DIM). It must stay readable — 2026-08-07: the
+        // DarkGray+DIM "nearly out" tier was too dim on the terminal's
+        // palette, so it was raised to the same step as the datetime.
+        Span::styled(dir, base.add_modifier(Modifier::DIM)),
         Span::styled(name, name_style),
     ];
     if show_dt {
