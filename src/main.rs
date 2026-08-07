@@ -2051,6 +2051,7 @@ mod tests {
         let mk = |rel: &str, age_h: u64| FileEntry {
             path: p(&format!("/r/{rel}")),
             rel: p(rel),
+            rel_lower: rel.to_lowercase(),
             mtime: UNIX_EPOCH + Duration::from_secs(now.timestamp() as u64 - age_h * 3600),
             ctime: UNIX_EPOCH,
             is_dir: false,
@@ -2154,6 +2155,7 @@ mod tests {
                 FileEntry {
                     path: p("/r/a.md"),
                     rel: p("a.md"),
+                    rel_lower: "a.md".into(),
                     mtime: std::time::UNIX_EPOCH,
                     ctime: std::time::UNIX_EPOCH,
                     is_dir: false,
@@ -2162,6 +2164,7 @@ mod tests {
                 FileEntry {
                     path: p("/r/b.rs"),
                     rel: p("b.rs"),
+                    rel_lower: "b.rs".into(),
                     mtime: std::time::UNIX_EPOCH,
                     ctime: std::time::UNIX_EPOCH,
                     is_dir: false,
@@ -2218,6 +2221,7 @@ mod tests {
         let mk = |rel: &str, age_h: u64| FileEntry {
             path: p(&format!("/r/{rel}")),
             rel: p(rel),
+            rel_lower: rel.to_lowercase(),
             mtime: UNIX_EPOCH
                 + StdDuration::from_secs(now.timestamp() as u64 - age_h * 3600),
             ctime: UNIX_EPOCH,
@@ -2536,6 +2540,7 @@ mod tests {
         let mk = |p: &std::path::Path, secs: u64| FileEntry {
             path: p.to_path_buf(),
             rel: p.file_name().unwrap().into(),
+            rel_lower: p.file_name().unwrap().to_string_lossy().to_lowercase(),
             mtime: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
             ctime: std::time::UNIX_EPOCH,
             is_dir: false,
@@ -2573,6 +2578,7 @@ mod tests {
         let mk = |rel: &str, secs: u64| FileEntry {
             path: p(&format!("/r/{rel}")),
             rel: p(rel),
+            rel_lower: rel.to_lowercase(),
             mtime: UNIX_EPOCH + StdDuration::from_secs(secs),
             ctime: UNIX_EPOCH + StdDuration::from_secs(secs),
             is_dir: false,

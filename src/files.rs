@@ -28,6 +28,10 @@ pub struct FileEntry {
     pub path: PathBuf,
     /// Path relative to the scan root ("" for the root itself).
     pub rel: PathBuf,
+    /// `display_rel()` lowercased, computed once at scan time: filter
+    /// matching runs against this instead of re-lowercasing every entry
+    /// on each keystroke (see [`matches_prepared`]).
+    pub rel_lower: String,
     /// Modified time (sort and cluster basis).
     pub mtime: SystemTime,
     /// Change time (ctime) — sort basis for `--sort ctime`. Unix-only via
@@ -207,8 +211,9 @@ pub fn is_fresh(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> boo
 /// `src/main.rs`, `/src/` matches `src/…` paths, `/.md` matches `.md`
 /// files (spec: パスのどの位置でもマッチ).
 /// (One-shot form: the hot paths prepare the needle once and call
-/// [`matches_prepared`] per entry; this stays as the simple API and the
-/// unit tests' entry point.)
+/// [`matches_prepared`] per entry, which searches the entry's scan-time
+/// lowercased path; this stays as the simple API and the unit tests'
+/// entry point.)
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn matches_filter(entry: &FileEntry, filter: &str) -> bool {
     matches_prepared(entry, &prepare_filter(filter))
@@ -220,9 +225,13 @@ pub fn prepare_filter(filter: &str) -> String {
     filter.strip_prefix('/').unwrap_or(filter).to_lowercase()
 }
 
-/// Match against a [`prepare_filter`]-normalized needle.
+/// Match against a [`prepare_filter`]-normalized needle. The entry side
+/// is already lowercased ([`FileEntry::rel_lower`], computed once at
+/// scan time), so a list rebuild pays one lowercase pass on the needle
+/// and none per entry — the old per-entry `display_rel().to_lowercase()`
+/// alone cost hundreds of milliseconds per keystroke on 100k-file trees.
 pub fn matches_prepared(entry: &FileEntry, needle: &str) -> bool {
-    entry.display_rel().to_lowercase().contains(needle)
+    entry.rel_lower.contains(needle)
 }
 
 /// Whether a walk entry should be excluded by the always-on ignores or the
@@ -307,11 +316,17 @@ pub fn scan(root: &Path, show_hidden: bool, show_dirs: bool) -> Result<Vec<FileE
         if rel.as_os_str().is_empty() {
             continue;
         }
+        // Lowercase the search string once here: matches_prepared runs on
+        // every filter keystroke, and re-lowercasing per entry per rebuild
+        // is what made big trees slow (the needle side is already prepared
+        // once per rebuild by prepare_filter).
+        let rel_lower = rel.to_string_lossy().replace('\\', "/").to_lowercase();
         out.push(FileEntry {
             mtime: meta.modified().unwrap_or(UNIX_EPOCH),
             ctime: ctime_of(&meta),
             path,
             rel,
+            rel_lower,
             is_dir: ft.is_dir(),
             size: meta.len(),
         });
@@ -438,6 +453,7 @@ mod tests {
         FileEntry {
             path: PathBuf::from("/root").join(rel),
             rel: PathBuf::from(rel),
+            rel_lower: rel.to_lowercase(),
             mtime,
             ctime: mtime,
             is_dir: false,
@@ -498,6 +514,32 @@ mod tests {
         assert!(matches_filter(&entry("src/main.rs", t(1)), "/")); // bare slash = all
         assert!(!matches_filter(&entry("src/main.rs", t(1)), "toml"));
         assert!(matches_filter(&entry("a/b/c", t(1)), "")); // empty = all
+    }
+
+    #[test]
+    fn filter_matches_mixed_case_paths() {
+        let e = entry("Src/Util/Main.RS", t(1));
+        assert!(matches_filter(&e, "main.rs"));
+        assert!(matches_filter(&e, "/SRC/"));
+        assert!(matches_filter(&e, "util"));
+        assert!(matches_filter(&e, "s")); // any letter, upper or lower
+        assert!(!matches_filter(&e, "toml"));
+    }
+
+    #[test]
+    fn filter_lowercases_unicode_paths() {
+        // Lowercasing is Unicode-aware: umlauts and accented letters
+        // match their lowercase needle, in either direction.
+        assert!(matches_filter(&entry("docs/Märchen.md", t(1)), "märchen"));
+        assert!(matches_filter(&entry("CAFÉ.txt", t(1)), "café"));
+        assert!(matches_filter(&entry("café.txt", t(1)), "CAFÉ"));
+        // Greek: uppercase Σ lowercases to σ, so the lowercase needle
+        // matches the uppercase path.
+        assert!(matches_filter(&entry("Σίσυφος.txt", t(1)), "σίσυφος"));
+        // İ (I with dot above) expands to two chars when lowercased
+        // (i + combining dot): the match needs the expanded form.
+        assert!(matches_filter(&entry("\u{130}stanbul.txt", t(1)), "i\u{307}stanbul"));
+        assert!(!matches_filter(&entry("\u{130}stanbul.txt", t(1)), "istanbul"));
     }
 
     /// Build a temp tree and scan it, asserting which entries survive.
@@ -599,6 +641,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(with_dirs.contains(&"src".to_string()));
         assert!(with_dirs.contains(&"src/util".to_string()));
+    }
+
+    #[test]
+    fn scan_precomputes_the_lowercased_search_string() {
+        let dir = make_tree();
+        let entries = scan(dir.path(), false, true).unwrap();
+        assert!(!entries.is_empty());
+        for e in &entries {
+            // rel_lower is exactly the display path lowercased once at
+            // scan time — the string matches_prepared searches.
+            assert_eq!(e.rel_lower, e.display_rel().to_lowercase());
+        }
+        // And the precomputed string drives filtering.
+        assert!(entries.iter().any(|e| matches_prepared(e, "main.rs")));
     }
 
     #[test]
