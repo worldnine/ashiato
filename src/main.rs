@@ -754,12 +754,19 @@ impl App {
 
     /// Cursor one file row up (k / Up), skipping separators.
     fn move_up(&mut self, list_h: usize) {
-        let mut row = self.cursor;
+        let start = self.cursor;
+        let mut row = start;
         while row > 0 {
             row -= 1;
             if matches!(self.visible[row], Row::File(_)) {
                 break;
             }
+        }
+        // The loop stops early only on a file, so running off the top can
+        // land on the first cluster's separator — never a cursor target.
+        // Keep the old cursor then (the invariant: cursor sits on a file).
+        if !matches!(self.visible.get(row), Some(Row::File(_))) {
+            row = start;
         }
         self.cursor = row;
         self.sync_offset(list_h);
@@ -2668,5 +2675,119 @@ mod tests {
         scroll_view(&mut app, -1, 5);
         assert_eq!(app.offset, 4);
         assert_eq!(app.cursor, 8, "cursor snaps to the window's last row");
+    }
+
+    #[test]
+    fn move_up_at_the_top_stays_on_the_first_file() {
+        // visible: [Sep(Today), File(0), File(1), Sep(Yesterday), File(2)]
+        let mut app = test_app(Vec::new());
+        app.visible = vec![
+            Row::Separator(Cluster::Today),
+            Row::File(0),
+            Row::File(1),
+            Row::Separator(Cluster::Yesterday),
+            Row::File(2),
+        ];
+        let h = 10; // the whole list fits in the window
+        app.cursor = 1;
+        app.offset = 0;
+        // k from the first file: the Today separator above is never a
+        // cursor target, so the cursor stays put. (Regression: move_up
+        // ran off the top onto the separator, which blanked the preview
+        // and made Enter fail with "no files".)
+        app.move_up(h);
+        assert_eq!(app.cursor, 1, "k at the top stays on the first file");
+        assert_eq!(app.offset, 0, "the view must not move");
+        // k from the later cluster still skips its separator.
+        app.cursor = 4;
+        app.move_up(h);
+        assert_eq!(app.cursor, 2, "k skips the Yesterday separator");
+    }
+
+    #[test]
+    fn movement_keys_and_scroll_never_land_on_separators() {
+        // visible: [Sep(Today), F(0), F(1), F(2), F(3), Sep(Yesterday),
+        //           F(4), F(5), F(6), F(7), F(8)]
+        let mut app = test_app(Vec::new());
+        app.visible = vec![
+            Row::Separator(Cluster::Today),
+            Row::File(0),
+            Row::File(1),
+            Row::File(2),
+            Row::File(3),
+            Row::Separator(Cluster::Yesterday),
+            Row::File(4),
+            Row::File(5),
+            Row::File(6),
+            Row::File(7),
+            Row::File(8),
+        ];
+        let h = 5;
+        let assert_on_file = |app: &App, ctx: &str| {
+            assert!(
+                matches!(app.visible.get(app.cursor), Some(Row::File(_))),
+                "{ctx}: cursor {} must sit on a file row",
+                app.cursor
+            );
+        };
+        // j walks down to the first cluster's last file, then crosses
+        // the separator onto the first Yesterday file.
+        app.cursor = 1;
+        app.offset = 0;
+        for _ in 0..3 {
+            app.move_down(h);
+        }
+        assert_eq!(app.cursor, 4);
+        app.move_down(h);
+        assert_eq!(app.cursor, 6, "j skips the Yesterday separator");
+        assert_on_file(&app, "after j across the separator");
+        // k crosses back over the separator, then walks up to the top —
+        // where k must stop on the first file, not the Today separator.
+        app.move_up(h);
+        assert_eq!(app.cursor, 4, "k skips the Yesterday separator");
+        for _ in 0..3 {
+            app.move_up(h);
+        }
+        assert_eq!(app.cursor, 1);
+        app.move_up(h);
+        assert_eq!(app.cursor, 1, "k at the top stays on the first file");
+        // g / G: the exact expressions the key handler runs.
+        app.cursor = first_file_row(&app.visible);
+        assert_eq!(app.cursor, 1, "g lands on the first file");
+        app.cursor = clamp_to_file(&app.visible, app.visible.len().saturating_sub(1));
+        assert_eq!(app.cursor, 10, "G lands on the last file");
+        // Half-page (PgDn/PgUp): clamp_to_file snaps past separators.
+        app.cursor = 3;
+        half_page_down(&mut app, h);
+        assert_eq!(app.cursor, 6, "PgDn snaps to the next file");
+        half_page_up(&mut app, h);
+        assert_eq!(app.cursor, 4, "PgUp snaps to the previous file");
+        half_page_up(&mut app, h);
+        assert_eq!(app.cursor, 2);
+        half_page_up(&mut app, h);
+        assert_eq!(app.cursor, 1, "PgUp at the top snaps to the first file");
+        // Wheel: scroll down until the offset lands on the Yesterday
+        // separator — the dragged cursor must snap to the next file.
+        app.cursor = 1;
+        app.offset = 0;
+        for _ in 0..5 {
+            scroll_view(&mut app, 1, h);
+        }
+        assert_eq!(app.offset, 5, "offset sits on the separator row");
+        assert_eq!(app.cursor, 6, "the dragged cursor skips the separator");
+        assert_on_file(&app, "after the drag onto a separator offset");
+        // Scroll up: while the cursor stays inside the window, the view
+        // is free to sit on a separator.
+        scroll_view(&mut app, -1, h);
+        assert_eq!(app.offset, 4);
+        assert_eq!(app.cursor, 6);
+        // Cursor below the window after a wheel-up: it snaps to the
+        // window's last file row, searching upward past the separator.
+        app.cursor = 10;
+        app.offset = 6;
+        scroll_view(&mut app, -1, h);
+        assert_eq!(app.offset, 5);
+        assert_eq!(app.cursor, 9, "the bottom drag lands on a file");
+        assert_on_file(&app, "after the bottom drag");
     }
 }
