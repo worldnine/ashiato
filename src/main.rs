@@ -1658,15 +1658,12 @@ fn toggle_span(name: &str, on: bool) -> Span<'static> {
     )
 }
 
-/// Cluster header: the date label sits a step darker than the DIM
-/// chrome (italic, bright-black) and the rule itself fades almost out
-/// (bright-black + DIM) — the header is orientation, not content, so
-/// the rule can be nearly invisible while the label stays readable.
+/// Cluster header: orientation, not content — the whole line fades
+/// almost out (bright-black + DIM), the date label distinguished only
+/// by its italics.
 fn separator_line(label: &str, width: usize) -> Line<'static> {
     let rule_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM);
-    let label_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let label_style = rule_style.add_modifier(Modifier::ITALIC);
     let head_w = files::display_width(&format!("── {label} "));
     let fill = "─".repeat(width.saturating_sub(head_w));
     Line::from(vec![
@@ -1760,7 +1757,8 @@ fn file_line(
     }
     let mut spans = vec![
         Span::styled(marker, name_style),
-        Span::styled(dir, base.add_modifier(Modifier::DIM)),
+        // The dir part is orientation, like the cluster rule: nearly out.
+        Span::styled(dir, base.fg(Color::DarkGray).add_modifier(Modifier::DIM)),
         Span::styled(name, name_style),
     ];
     if show_dt {
