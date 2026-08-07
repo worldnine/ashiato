@@ -73,7 +73,7 @@ __pycache__/
 ┌── ashiato · /path/to/project · 23 files ──────────────────────────┐
 │                                                                     │
 │  ── Today ─────────────────────────────────────────────────────── │
-│  > design.md                    12m ago │  1 // design.md          │
+│  > design.md                        now │  1 // design.md          │
 │    src/main.rs                   2h ago │  2                       │
 │                                          │  3 ## 設計ドキュメント    │
 │  ── Yesterday ─────────────────────────────────────────────────── │
