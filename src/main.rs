@@ -2082,6 +2082,8 @@ mod tests {
             needs_immediate_redraw: false,
             last_refresh: Instant::now(),
             refresh_every: REFRESH_TICK,
+            last_input: Instant::now(),
+            bursting: false,
             running: true,
         };
         app.rebuild_visible(None);
