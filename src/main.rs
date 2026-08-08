@@ -2082,8 +2082,9 @@ fn separator_line(label: &str, width: usize, border: Color) -> Line<'static> {
 /// row) + a right-aligned secondary element: the datetime (DIM;
 /// italic within the hour — freshness is typography, not color), or —
 /// for files with uncommitted changes in a git repo — the `+N -M`
-/// marker (spec 4-1: change scale fused with the uncommitted signal;
-/// the time it replaces is the same DIM tier). Hidden when the name
+/// marker fused with the datetime (`+7 now`; spec 4-1's change scale
+/// fused with the uncommitted signal, without crushing the time
+/// browser's freshness cue). Hidden when the name
 /// needs the width — the cluster headers carry the date context, so
 /// the name always wins. The list respects the terminal palette:
 /// default fg + DIM for secondary text, ANSI accents only (2026-08-07;
@@ -2142,36 +2143,70 @@ fn file_line(
         name.to_string()
     };
     // Layout priority: marker + dir + name fill the row first; the
-    // right-side element is right-aligned only when it fits.
-    // Git: a dirty file's element is its `+N -M` marker — the change
-    // scale fused with the uncommitted signal (spec 4-1). A committed
-    // file keeps the datetime. One element either way: the marker
-    // never stacks onto a time, and committed rows look exactly as
-    // before.
-    let (right, is_time) = match app.git.as_ref().and_then(|g| g.marker_for(&e.path)) {
-        Some(st) => (st.marker(), false),
-        None => (format_time(now, to_local(e.mtime)), true),
-    };
-    let right_w = files::display_width(&right);
+    // right side is right-aligned only when it fits.
+    // Git: a dirty file's right side is its `+N -M` marker fused with
+    // the freshness time (`+7 now`) — the marker carries the change
+    // scale and the uncommitted signal (spec 4-1), the time keeps
+    // ashiato's core (the mtime browser must not lose "now"), so the
+    // spec's "one element" is the whole right side, not a bare marker.
+    // When the width tightens the time is sacrificed first — recency
+    // already lives in the mtime sort and the cluster headers — and a
+    // dirty row never silently loses its marker. Committed rows keep
+    // exactly the pre-git display.
+    let dt = format_time(now, to_local(e.mtime));
+    let dt_w = files::display_width(&dt);
+    let git_marker = app
+        .git
+        .as_ref()
+        .and_then(|g| g.marker_for(&e.path))
+        .map(git::GitStatus::marker);
+    let git_marker_w =
+        git_marker.as_ref().map(|m| files::display_width(m)).unwrap_or(0);
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
     let left_w = files::display_width(&dir) + files::display_width(&name);
     // At least two columns of gap, or the name butts against the element.
-    let show_right = left_w + right_w + 2 <= avail;
-    let pad = avail.saturating_sub(left_w + right_w);
-    // The element is secondary text (DIM). Freshness (`now`/`Nm ago` —
+    let room = avail.saturating_sub(left_w).saturating_sub(2);
+    let marker_fits = git_marker.is_some() && git_marker_w <= room;
+    let compound_fits = marker_fits && git_marker_w + 1 + dt_w <= room;
+    let time_fits = git_marker.is_none() && dt_w <= room;
+    // Both pieces are secondary text (DIM). Freshness (`now`/`Nm ago` —
     // within the hour) italicizes the *time* only; a marker has no
     // freshness cue of its own (it already says "uncommitted").
     // Away-diff sinks the untouched files' elements a step further
     // (DarkGray + DIM) so the touched ones stand out by contrast — the
     // sinking outranks the fresh cue: it is the whole point.
     let fresh = is_fresh(now, to_local(e.mtime));
-    let mut right_style = base.add_modifier(Modifier::DIM);
-    if away_diff && !in_away {
-        right_style = right_style.fg(Color::DarkGray);
-    } else if is_time && fresh {
-        right_style = right_style.add_modifier(Modifier::ITALIC);
+    let away_sink = away_diff && !in_away;
+    let marker_style = {
+        let mut s = base.add_modifier(Modifier::DIM);
+        if away_sink {
+            s = s.fg(Color::DarkGray);
+        }
+        s
+    };
+    let mut time_style = base.add_modifier(Modifier::DIM);
+    if away_sink {
+        time_style = time_style.fg(Color::DarkGray);
+    } else if fresh {
+        time_style = time_style.add_modifier(Modifier::ITALIC);
     }
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    if let Some(m) = &git_marker {
+        if marker_fits {
+            right_spans.push(Span::styled(m.clone(), marker_style));
+            if compound_fits {
+                right_spans.push(Span::raw(" "));
+                right_spans.push(Span::styled(dt, time_style));
+            }
+        }
+    } else if time_fits {
+        right_spans.push(Span::styled(dt, time_style));
+    }
+    let right_w: usize = right_spans
+        .iter()
+        .map(|s| files::display_width(s.content.as_ref()))
+        .sum();
     let mut spans = vec![
         Span::styled(marker, name_style),
         // The dir part is orientation, like the cluster rule: the
@@ -2182,9 +2217,9 @@ fn file_line(
         Span::styled(dir, base.fg(app.ui_border)),
         Span::styled(name, name_style),
     ];
-    if show_right {
-        spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(right, right_style));
+    if !right_spans.is_empty() {
+        spans.push(Span::styled(" ".repeat(avail.saturating_sub(left_w + right_w)), base));
+        spans.extend(right_spans);
     }
     Line::from(spans)
 }
@@ -3441,12 +3476,16 @@ mod tests {
             2,
             "only the edited b.rs and the untracked c.txt remain"
         );
-        // The dirty rows render the marker; the committed row shows the
-        // plain time (no '+' anywhere).
+        // The dirty rows render the marker fused with the freshness
+        // time; the committed row shows the plain time (no '+' anywhere).
         let now = chrono::Local::now();
         let idx = |rel: &str| app.files.iter().position(|e| e.rel == p(rel)).unwrap();
         let dirty = file_line(&app, idx("b.rs"), 80, false, now, false);
         assert!(dirty.to_string().contains("+1"), "b.rs: one added line");
+        assert!(
+            dirty.to_string().contains("+1 now"),
+            "the marker is fused with the freshness time, not replacing it"
+        );
         let clean = file_line(&app, idx("a.md"), 80, false, now, false);
         assert!(
             !clean.to_string().contains('+'),
@@ -3456,6 +3495,43 @@ mod tests {
         on_key(&mut app, KeyCode::Char('u'), KeyModifiers::empty(), None);
         assert!(!app.uncommitted_only);
         assert_eq!(app.visible_count(), 3);
+    }
+
+    #[test]
+    fn dirty_rows_sacrifice_time_before_marker_on_narrow_widths() {
+        let Some(dir) = git_repo(&[("src/b.rs", "two\n"), ("a.md", "one\n")]) else {
+            return;
+        };
+        std::fs::write(dir.path().join("src/b.rs"), "two\nchanged\n").unwrap();
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.git = git::GitCache::discover(dir.path());
+        app.rescan();
+        let now = chrono::Local::now();
+        let idx = app.files.iter().position(|e| e.rel == p("src/b.rs")).unwrap();
+        // Wide: marker and time coexist (`+1 now`).
+        let wide = file_line(&app, idx, 80, false, now, false);
+        assert!(
+            wide.to_string().contains("+1 now"),
+            "both pieces fit on a wide row: {}",
+            wide.to_string()
+        );
+        // Narrow (14): the time goes first — recency lives in the
+        // mtime sort and the cluster headers — and the uncommitted
+        // signal survives.
+        let narrow = file_line(&app, idx, 14, false, now, false).to_string();
+        assert!(narrow.contains("+1"), "the marker survives: {narrow:?}");
+        assert!(
+            !(narrow.contains("now") || narrow.contains("m ago") || narrow.contains(':')),
+            "the time is the first sacrifice: {narrow:?}"
+        );
+        // A committed row at the same width keeps the time (pre-git).
+        let idx_clean = app.files.iter().position(|e| e.rel == p("a.md")).unwrap();
+        let clean = file_line(&app, idx_clean, 14, false, now, false).to_string();
+        assert!(
+            clean.contains("now") || clean.contains("m ago") || clean.contains(':'),
+            "committed rows keep the time: {clean:?}"
+        );
     }
 
     #[test]

@@ -79,7 +79,7 @@ Changes are detected by `(mtime, size, is_dir)` — an edit that keeps all three
 
 Inside a git work tree, ashiato marks files with uncommitted changes (spec: [git-integration-spec.md](https://github.com/worldnine/akapen/blob/main/docs/git-integration-spec.md) §4):
 
-- A dirty row's right side shows `+N -M` — the diff's line scale fused with the "uncommitted" signal into one element (dim, the same tier as the time it replaces). Committed rows keep the plain time display.
+- A dirty row's right side shows `+N -M` fused with the freshness time (`+7 now`) — the diff's line scale + the "uncommitted" signal (spec 4-1), without crushing ashiato's time display. Committed rows keep the plain time. When the width is tight the time is sacrificed first (recency still lives in the mtime sort and the cluster headers).
 - Untracked files (`??`) count as uncommitted; their `+N` is the file's own line count. Binary files show a bare `-`.
 - `u` toggles the listing to uncommitted files only (footer `[uncommitted]`; the text filter `/` and `--filter` are untouched).
 - Outside a repo — or with git missing — all of this is off: rows and keys behave exactly as before.
@@ -125,3 +125,10 @@ The repo is also a [herdr plugin](herdr-plugin.toml): `herdr plugin link <this r
 MIT License.
 
 `src/highlight.rs` is a copy of [akapen](https://github.com/worldnine/akapen)'s highlighter, which in turn adapts [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) (MIT, Dmitry Persiyanov).
+
+## Git integration demo
+
+This line was added to demonstrate the `+N -M` uncommitted marker.
+
+- edit: tracked file → `+1`
+- the untracked file `docs/git-demo.md` → `+N` (its own line count)
