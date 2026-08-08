@@ -1,0 +1,18 @@
+# herdr-plugin.toml — ashiato: herdr から md ピッカーを開く。
+#
+# 流儀: herdr 連携コードはツールのリポジトリに plugin として同居させる
+# （`herdr plugin link`）。~/.local/bin には置かない。
+# キーバインドは config.toml 側（[[keys.command]] type = "plugin_action"）。
+id = "ashiato"
+name = "ashiato"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Open the ashiato markdown picker in a side pane (akapen --send-agent)"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "ashiato: pick markdown files (side pane)"
+description = "Open the mtime-sorted markdown picker next to the agent pane"
+contexts = ["workspace", "tab", "pane"]
+command = ["bash", "scripts/ashiato-pane.sh"]
