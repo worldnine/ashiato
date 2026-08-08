@@ -9,7 +9,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent}"
+# akapen は ashiato の子プロセスとして走る（ashiato は TUI をサスペンドして
+# open-cmd を実行し、終了後にピッカーへ戻る）→ pane は閉じない。Esc で抜ける
+# ため akapen 側に --esc-quit always を渡す。
+OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent --esc-quit always}"
 
 TAB="${HERDR_TAB_ID:-}"
 if [ -z "$TAB" ] && [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
