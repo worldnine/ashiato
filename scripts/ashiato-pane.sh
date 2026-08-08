@@ -9,9 +9,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# akapen は ashiato の子プロセスとして走る（ashiato は TUI をサスペンドして
-# open-cmd を実行し、終了後にピッカーへ戻る）→ pane は閉じない。Esc で抜ける
-# ため akapen 側に --esc-quit always を渡す。
+# ashiato は TUI をサスペンドして open-cmd を実行し、終了後にピッカーへ戻る）→ pane は閉じない。
+# Esc で抜けるため akapen 側に --esc-quit always を渡す。
+# ashiato を終了（q / Ctrl+C）したら、使い捨ての pane ごと閉じる。
 OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent --esc-quit always}"
 
 TAB="${HERDR_TAB_ID:-}"
@@ -46,4 +46,6 @@ fi
 RESPONSE=$(herdr pane split "${SPLIT_TARGET[@]}" --direction right --focus)
 PANE_ID=$(printf '%s' "$RESPONSE" | jq -r '.result.pane.pane_id')
 herdr pane rename "$PANE_ID" "ashiato"
-herdr pane run "$PANE_ID" "ashiato --filter .md --open-cmd '$OPEN {}'"
+# ashiato が終了したら `;` の右で pane を閉じる（pane は使い捨て）。
+# 終了 = q / Ctrl+C のみ。Esc は akapen を抜けてピッカーへ戻るだけなので閉じない。
+herdr pane run "$PANE_ID" "ashiato --filter .md --open-cmd '$OPEN {}'; herdr pane close $PANE_ID"
