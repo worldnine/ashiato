@@ -59,6 +59,7 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `t` | cycle sort order |
 | `Ctrl+h` | toggle hidden (dot-directories) |
 | `d` | toggle directories |
+| `u` | toggle: only files with uncommitted changes (git repos; dirty rows show `+N -M`) |
 | `q` | quit |
 
 The list rescans every 2 seconds; when an agent edits files in another pane, they float up live. Cursor and selection follow by path.
@@ -73,6 +74,17 @@ ashiato tracks terminal focus via xterm focus reporting (DECSET 1004; kitty, Wez
 - **When focus returns**, the display reverts to the normal listing instantly — no flash (the mtime sort already floated the changed files to the top).
 
 Changes are detected by `(mtime, size, is_dir)` — an edit that keeps all three (e.g. `touch -r` restoring the mtime after a same-size write) is not visible as a change; the preview cache has the same signature, so such edits can also leave a stale preview until the next real change.
+
+### Git integration
+
+Inside a git work tree, ashiato marks files with uncommitted changes (spec: [git-integration-spec.md](https://github.com/worldnine/akapen/blob/main/docs/git-integration-spec.md) §4):
+
+- A dirty row's right side shows `+N -M` — the diff's line scale fused with the "uncommitted" signal into one element (dim, the same tier as the time it replaces). Committed rows keep the plain time display.
+- Untracked files (`??`) count as uncommitted; their `+N` is the file's own line count. Binary files show a bare `-`.
+- `u` toggles the listing to uncommitted files only (footer `[uncommitted]`; the text filter `/` and `--filter` are untouched).
+- Outside a repo — or with git missing — all of this is off: rows and keys behave exactly as before.
+
+`git status` / `git diff --numstat` are queried only when the filesystem listing actually changed (signature-gated), so the every-2s refresh of a stable tree never spawns git; a snapshot can go stale until the next real change (the spec's P4 snapshot principle).
 
 ## The review loop
 

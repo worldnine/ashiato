@@ -21,11 +21,19 @@
 //! The root resolves from: the positional argument → herdr (`HERDR_ENV=1`
 //! → `herdr worktree list` → `herdr agent list`) → the current directory.
 //!
+//! Git integration (git-integration-spec.md §4) is a dormant add-on:
+//! inside a work tree, rows with uncommitted changes get a `+N -M`
+//! marker (change scale fused with the uncommitted signal, spec 4-1)
+//! and `u` filters the listing to them (4-2). Outside a repo all of
+//! it is off — the exact pre-git behavior (P1). The cache strategy
+//! (git is queried only when the listing changes) lives in git.rs.
+//!
 //! This prototype shares akapen's `highlight` module (syntect) so it
 //! can later move into the akapen repo as `src/bin/ashiato.rs`.
 
 mod clipboard;
 mod files;
+mod git;
 mod herdr;
 mod highlight;
 mod preview;
@@ -399,7 +407,9 @@ fn main() -> Result<()> {
                  \x20 \\              toggle the filter off/on (text is kept)\n\
                  \x20 t              sort cycle: mtime↓ mtime↑ ctime↓ ctime↑\n\
                  \x20 Ctrl+h/Backspace  toggle hidden dirs   d  toggle directories\n\
-                 \x20 q              quit   Esc  clear selection"
+                 \x20 q              quit   Esc  clear selection
+                 \x20 u              toggle: only files with uncommitted changes
+                 \x20                   (in a git repo; dirty rows show +N -M)"
             )?;
             Ok(())
         }
@@ -496,6 +506,12 @@ struct App {
     /// away, only the *other* files' times dim (the touched times keep
     /// the normal gray); dropped on focus return.
     away_changes: Vec<PathBuf>,
+    /// Git snapshot (git-integration-spec.md §4): `None` outside a
+    /// work tree — no markers, `u` is a dead key, and the rows look
+    /// exactly as before (P1).
+    git: Option<git::GitCache>,
+    /// `u` key: show only files with uncommitted changes (spec 4-2).
+    uncommitted_only: bool,
     running: bool,
 }
 
@@ -594,6 +610,12 @@ impl App {
             if cutoff.is_some_and(|c| e.mtime < c) {
                 continue;
             }
+            // `u` filter: only files with uncommitted changes (spec
+            // 4-2). Composes with the text filter and the --since
+            // cutoff above — three independent axes.
+            if self.uncommitted_only && !self.is_uncommitted(e) {
+                continue;
+            }
             let c = cluster_of(to_local(e.mtime), now);
             if last_cluster != Some(c) {
                 last_cluster = Some(c);
@@ -612,12 +634,30 @@ impl App {
             .unwrap_or_else(|| first_file_row(&self.visible));
     }
 
+    /// Whether a file has uncommitted changes (git active only).
+    fn is_uncommitted(&self, e: &FileEntry) -> bool {
+        self.git
+            .as_ref()
+            .is_some_and(|g| g.marker_for(&e.path).is_some())
+    }
+
+    /// Push a fresh listing through the git cache. The cache re-queries
+    /// git only when the listing changed since its last query (spec §5:
+    /// the every-2s refresh tick that finds the tree unchanged must not
+    /// spawn `git status` on every tick).
+    fn refresh_git(&mut self, entries: &[FileEntry]) {
+        if let Some(g) = &mut self.git {
+            g.refresh_if_listing_changed(entries);
+        }
+    }
+
     /// Re-scan the root, re-sort, remap the selection by path, and rebuild
     /// the visible list (used after child exits and on toggle changes).
     fn rescan(&mut self) {
         match files::scan(&self.root, self.show_hidden, self.show_dirs) {
             Ok(mut entries) => {
                 files::sort_entries(&mut entries, self.sort);
+                self.refresh_git(&entries);
                 self.commit_scan(entries);
             }
             Err(e) => {
@@ -672,6 +712,7 @@ impl App {
         // back off to a ~10% duty cycle instead of freezing every tick.
         self.refresh_every = REFRESH_TICK.max(started.elapsed() * 10);
         if entries != self.files {
+            self.refresh_git(&entries);
             self.commit_scan(entries);
         }
     }
@@ -1250,6 +1291,8 @@ fn run(config: Config) -> Result<()> {
         last_render_finish: None,
         focused: true,
         away_changes: Vec::new(),
+        git: None,
+        uncommitted_only: false,
         running: true,
     };
     // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
@@ -1271,6 +1314,12 @@ fn run(config: Config) -> Result<()> {
     // the filter later.
     app.filter = app.config.filter.clone();
     app.since = app.config.since;
+    // The git snapshot's first full query (status + numstat) can take
+    // a moment on a big repo — it runs under the "scanning…" frame,
+    // like the first filesystem scan. Discovery itself is one cheap
+    // `rev-parse`; the full query waits for the first listing (rescan
+    // → refresh_git), so the signature gate starts clean.
+    app.git = git::GitCache::discover(&app.root);
     app.rescan();
     if app.files.is_empty() {
         let failed = app.status.as_ref().is_some_and(|(_, _, err)| *err);
@@ -1429,6 +1478,20 @@ fn on_key(
                 "directories hidden"
             });
             app.rescan();
+        }
+        // `u`: "only files with uncommitted changes" (git repos, spec
+        // 4-2). Outside a repo it is a dead key — the pre-git behavior
+        // (4-3: `u` 無効).
+        KeyCode::Char('u') => {
+            if app.git.is_some() {
+                app.uncommitted_only = !app.uncommitted_only;
+                app.flash(if app.uncommitted_only {
+                    "uncommitted only"
+                } else {
+                    "showing all"
+                });
+                app.rebuild_visible(None);
+            }
         }
         KeyCode::Char('q') => app.running = false,
         // Raw mode eats the tty's SIGINT, so Ctrl+C arrives as a key
@@ -1853,12 +1916,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     let mut list_lines: Vec<Line> = Vec::with_capacity(list_h);
     let list_width = list_area.width.saturating_sub(1) as usize;
     if app.visible.is_empty() {
+        let msg = if app.uncommitted_only && (app.filter.is_empty() || !app.filter_on) {
+            "no uncommitted changes"
+        } else if app.filter.is_empty() || !app.filter_on {
+            "no files"
+        } else {
+            "no match"
+        };
         list_lines.push(Line::from(Span::styled(
-            if app.filter.is_empty() || !app.filter_on {
-                "no files"
-            } else {
-                "no match"
-            },
+            msg,
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -1913,6 +1979,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     footer1.push(toggle_span("hidden", app.show_hidden));
     footer1.push(Span::raw(" "));
     footer1.push(toggle_span("dirs", app.show_dirs));
+    if app.git.is_some() {
+        footer1.push(Span::raw(" "));
+        footer1.push(toggle_span("uncommitted", app.uncommitted_only));
+    }
     if !app.filter.is_empty() {
         footer1.push(Span::raw(" "));
         footer1.push(Span::styled(
@@ -1942,7 +2012,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    let footer2 = vec![
+    let mut footer2 = vec![
         hint("Space", "select"),
         hint("Enter", if app.config.open_cmd.is_some() { "open" } else { "output" }),
         hint("y", "copy"),
@@ -1953,6 +2023,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         hint("d", "dirs"),
         hint("q", "quit"),
     ];
+    if app.git.is_some() {
+        footer2.push(hint("u", "uncommitted"));
+    }
     if let Some((msg, _, err)) = &app.status {
         footer1.push(Span::raw("  "));
         footer1.push(Span::styled(
@@ -2006,12 +2079,15 @@ fn separator_line(label: &str, width: usize, border: Color) -> Line<'static> {
 
 /// One file row: marker + dir part (border color — same quiet as the
 /// title's frame) + basename (terminal default fg, Cyan on the cursor
-/// row) + right-aligned time (DIM; italic within
-/// the hour — freshness is typography, not color; hidden when the name
-/// needs the width — the cluster headers carry the date context, so the
-/// name always wins). The list respects the terminal palette: default
-/// fg + DIM for secondary text, ANSI accents only (2026-08-07; the
-/// syntect theme fg / RGB ladder experiments were dropped).
+/// row) + a right-aligned secondary element: the datetime (DIM;
+/// italic within the hour — freshness is typography, not color), or —
+/// for files with uncommitted changes in a git repo — the `+N -M`
+/// marker (spec 4-1: change scale fused with the uncommitted signal;
+/// the time it replaces is the same DIM tier). Hidden when the name
+/// needs the width — the cluster headers carry the date context, so
+/// the name always wins. The list respects the terminal palette:
+/// default fg + DIM for secondary text, ANSI accents only (2026-08-07;
+/// the syntect theme fg / RGB ladder experiments were dropped).
 /// No icon (2026-08-05: the 📄/📁 emoji was dropped — extension-based
 /// reading is enough, per the spec's no-icon stance). Cursor and
 /// Space-selected rows get the akapen gray background (spec).
@@ -2066,26 +2142,35 @@ fn file_line(
         name.to_string()
     };
     // Layout priority: marker + dir + name fill the row first; the
-    // datetime is right-aligned only when it fits.
-    let dt = format_time(now, to_local(e.mtime));
-    let dt_w = files::display_width(&dt);
+    // right-side element is right-aligned only when it fits.
+    // Git: a dirty file's element is its `+N -M` marker — the change
+    // scale fused with the uncommitted signal (spec 4-1). A committed
+    // file keeps the datetime. One element either way: the marker
+    // never stacks onto a time, and committed rows look exactly as
+    // before.
+    let (right, is_time) = match app.git.as_ref().and_then(|g| g.marker_for(&e.path)) {
+        Some(st) => (st.marker(), false),
+        None => (format_time(now, to_local(e.mtime)), true),
+    };
+    let right_w = files::display_width(&right);
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
     let left_w = files::display_width(&dir) + files::display_width(&name);
-    // At least two columns of gap, or the name butts against the datetime.
-    let show_dt = left_w + dt_w + 2 <= avail;
-    let pad = avail.saturating_sub(left_w + dt_w);
-    // The time is secondary text (DIM). Freshness (`now`/`Nm ago` —
-    // within the hour) is italic, not a color. Away-diff sinks the
-    // untouched files' times a step further (DarkGray + DIM) so the
-    // touched ones stand out by contrast — the sinking outranks the
-    // fresh cue: it is the whole point.
+    // At least two columns of gap, or the name butts against the element.
+    let show_right = left_w + right_w + 2 <= avail;
+    let pad = avail.saturating_sub(left_w + right_w);
+    // The element is secondary text (DIM). Freshness (`now`/`Nm ago` —
+    // within the hour) italicizes the *time* only; a marker has no
+    // freshness cue of its own (it already says "uncommitted").
+    // Away-diff sinks the untouched files' elements a step further
+    // (DarkGray + DIM) so the touched ones stand out by contrast — the
+    // sinking outranks the fresh cue: it is the whole point.
     let fresh = is_fresh(now, to_local(e.mtime));
-    let mut dt_style = base.add_modifier(Modifier::DIM);
+    let mut right_style = base.add_modifier(Modifier::DIM);
     if away_diff && !in_away {
-        dt_style = dt_style.fg(Color::DarkGray);
-    } else if fresh {
-        dt_style = dt_style.add_modifier(Modifier::ITALIC);
+        right_style = right_style.fg(Color::DarkGray);
+    } else if is_time && fresh {
+        right_style = right_style.add_modifier(Modifier::ITALIC);
     }
     let mut spans = vec![
         Span::styled(marker, name_style),
@@ -2097,9 +2182,9 @@ fn file_line(
         Span::styled(dir, base.fg(app.ui_border)),
         Span::styled(name, name_style),
     ];
-    if show_dt {
+    if show_right {
         spans.push(Span::styled(" ".repeat(pad), base));
-        spans.push(Span::styled(dt, dt_style));
+        spans.push(Span::styled(right, right_style));
     }
     Line::from(spans)
 }
@@ -2568,6 +2653,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2629,6 +2716,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2668,6 +2757,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         };
         app.rebuild_visible(None);
@@ -2724,6 +2815,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         };
         // Focused: edits don't accumulate.
@@ -2781,6 +2874,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         };
         // 10 file rows, 5 visible; cursor at 9.
@@ -2861,6 +2956,8 @@ mod tests {
             last_render_finish: None,
             focused: true,
             away_changes: Vec::new(),
+            git: None,
+            uncommitted_only: false,
             running: true,
         }
     }
@@ -3295,5 +3392,109 @@ mod tests {
         // stale away stack must not flip the away-diff on.
         assert!(app.focused);
         assert!(app.running);
+    }
+
+    /// A temp git repo with one commit; `None` (test skipped) when git
+    /// is unavailable. The repo lives under the *canonical* temp root
+    /// so its paths match `git rev-parse`'s symlink-resolved output
+    /// (macOS `/var` → `/private/var`) — the prefix match in
+    /// `GitCache::marker_for` depends on both sides agreeing.
+    fn git_repo(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
+        if !git::git_available() {
+            return None;
+        }
+        let base =
+            std::env::temp_dir().canonicalize().unwrap_or_else(|_| std::env::temp_dir());
+        let dir = tempfile::Builder::new().tempdir_in(&base).unwrap();
+        git::git(dir.path(), &["init", "-q"]);
+        git::git(dir.path(), &["config", "user.email", "t@t"]);
+        git::git(dir.path(), &["config", "user.name", "t"]);
+        for (name, content) in files {
+            let p = dir.path().join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        git::git(dir.path(), &["add", "."]);
+        git::git(dir.path(), &["commit", "-qm", "init"]);
+        Some(dir)
+    }
+
+    #[test]
+    fn u_key_toggles_uncommitted_only_view_in_a_repo() {
+        let Some(dir) = git_repo(&[("a.md", "one\n"), ("b.rs", "two\n")]) else {
+            return;
+        };
+        // An unstaged edit and an untracked file — both must count as
+        // uncommitted (spec: `??` は未コミット変更として扱う).
+        std::fs::write(dir.path().join("b.rs"), "two\nchanged\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.git = git::GitCache::discover(dir.path());
+        app.rescan();
+        assert_eq!(app.visible_count(), 3);
+        // `u` filters to uncommitted files only.
+        on_key(&mut app, KeyCode::Char('u'), KeyModifiers::empty(), None);
+        assert!(app.uncommitted_only);
+        assert_eq!(
+            app.visible_count(),
+            2,
+            "only the edited b.rs and the untracked c.txt remain"
+        );
+        // The dirty rows render the marker; the committed row shows the
+        // plain time (no '+' anywhere).
+        let now = chrono::Local::now();
+        let idx = |rel: &str| app.files.iter().position(|e| e.rel == p(rel)).unwrap();
+        let dirty = file_line(&app, idx("b.rs"), 80, false, now, false);
+        assert!(dirty.to_string().contains("+1"), "b.rs: one added line");
+        let clean = file_line(&app, idx("a.md"), 80, false, now, false);
+        assert!(
+            !clean.to_string().contains('+'),
+            "committed rows keep the time display, no marker"
+        );
+        // `u` again: back to the full listing.
+        on_key(&mut app, KeyCode::Char('u'), KeyModifiers::empty(), None);
+        assert!(!app.uncommitted_only);
+        assert_eq!(app.visible_count(), 3);
+    }
+
+    #[test]
+    fn u_key_is_a_noop_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let mut app = test_app(files::scan(dir.path(), false, false).unwrap());
+        app.root = dir.path().to_path_buf();
+        app.rebuild_visible(None);
+        assert_eq!(app.visible_count(), 1);
+        on_key(&mut app, KeyCode::Char('u'), KeyModifiers::empty(), None);
+        assert!(
+            !app.uncommitted_only,
+            "u must not toggle outside a git repo (spec 4-3: `u` 無効)"
+        );
+        assert_eq!(app.visible_count(), 1, "the listing is untouched");
+    }
+
+    #[test]
+    fn git_markers_refresh_after_a_rescan() {
+        let Some(dir) = git_repo(&[("f.md", "one\n")]) else { return };
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.git = git::GitCache::discover(dir.path());
+        app.rescan();
+        let now = chrono::Local::now();
+        let idx = app.files.iter().position(|e| e.rel == p("f.md")).unwrap();
+        assert!(
+            !file_line(&app, idx, 80, false, now, false).to_string().contains('+'),
+            "clean at commit"
+        );
+        // The agent edits the file; the next rescan (post-Enter flow)
+        // must pick the marker up.
+        std::fs::write(dir.path().join("f.md"), "one\ntwo\n").unwrap();
+        app.rescan();
+        let idx = app.files.iter().position(|e| e.rel == p("f.md")).unwrap();
+        assert!(
+            file_line(&app, idx, 80, false, now, false).to_string().contains("+1"),
+            "rescan refreshes the git snapshot"
+        );
     }
 }
