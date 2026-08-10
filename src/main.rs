@@ -1345,9 +1345,43 @@ fn run(config: Config) -> Result<()> {
     res
 }
 
+/// Whether this process still has a controlling terminal — i.e. the
+/// pane/window this TUI runs in is alive. When the session leader exits
+/// (window/pane closed) the kernel releases the controlling terminal and
+/// `/dev/tty` stops opening (ENXIO), even though crossterm reads keep
+/// blocking (the pty master may stay open — herdr keeps it for
+/// scrollback). Polled every tick as a death watchdog.
+fn controlling_terminal_alive() -> bool {
+    std::fs::OpenOptions::new().read(true).open("/dev/tty").is_ok()
+}
+
+/// Whether stdin's writer is gone (POLLHUP): a pipe-based virtual
+/// terminal (e.g. a herdr plugin pane) whose owner closed. Reads would
+/// return EOF forever — crossterm never surfaces that as an event.
+fn stdin_hung_up() -> bool {
+    let mut pfd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: poll(2) on fd 0, which is open here (crossterm owns it).
+    let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+    n > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
 fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
     terminal.draw(|f| draw(f, app))?;
+    // Death watchdog: exit cleanly when the session dies under us. With
+    // a controlling terminal we watch `/dev/tty`; without one from the
+    // start (pipe-based virtual terminal) we watch stdin for HUP.
+    let watch_terminal = controlling_terminal_alive();
+    let watch_stdin = !watch_terminal;
     loop {
+        if (watch_terminal && !controlling_terminal_alive())
+            || (watch_stdin && stdin_hung_up())
+        {
+            return Err(anyhow::anyhow!("terminal gone; exiting"));
+        }
         // Burst-aware poll: while the user is mashing j/k the preview is
         // deferred (see mark_input / preview_lines), and the poll wakes
         // exactly when the burst ends so the final preview pops ~BURST_GAP
@@ -1642,7 +1676,34 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut TermGuard>) {
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
         g.raw_off();
     }
-    let status = Command::new("sh").arg("-c").arg(&cmd).status();
+    let mut child = match Command::new("sh").arg("-c").arg(&cmd).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            app.flash_err(format!("spawn failed: {e}"));
+            return;
+        }
+    };
+    // Death watchdog while the child owns the screen: if the session
+    // dies (pane/window closed) the child would otherwise leak and spin
+    // forever in a dead session. Kill it and bail — the terminal is gone,
+    // so restoring it is pointless.
+    let watch_terminal = controlling_terminal_alive();
+    let watch_stdin = !watch_terminal;
+    let status = loop {
+        if (watch_terminal && !controlling_terminal_alive())
+            || (watch_stdin && stdin_hung_up())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            app.flash_err("terminal gone — child killed");
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => break Err(e),
+        }
+    };
     if let Some(g) = terminal.as_deref_mut() {
         // Re-enter raw mode and rebuild a fresh terminal for the TUI.
         let _ = ratatui::crossterm::terminal::enable_raw_mode();
