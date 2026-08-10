@@ -13,6 +13,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Esc で抜けるため akapen 側に --esc-quit always を渡す。
 # ashiato を終了（q / Ctrl+C）したら、使い捨ての pane ごと閉じる。
 OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent --esc-quit always}"
+# o キー（--alt-open-cmd）: 選択ファイルを yazi で開く。q で抜けるとピッカーへ戻る。
+# ASHIATO_ALT_OPEN_CMD で差し替え可能（例: "code {}"）。
+ALT_OPEN="${ASHIATO_ALT_OPEN_CMD:-yazi {}}"
 
 TAB="${HERDR_TAB_ID:-}"
 if [ -z "$TAB" ] && [ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]; then
@@ -48,4 +51,4 @@ PANE_ID=$(printf '%s' "$RESPONSE" | jq -r '.result.pane.pane_id')
 herdr pane rename "$PANE_ID" "ashiato"
 # ashiato が終了したら `;` の右で pane を閉じる（pane は使い捨て）。
 # 終了 = q / Ctrl+C のみ。Esc は akapen を抜けてピッカーへ戻るだけなので閉じない。
-herdr pane run "$PANE_ID" "ashiato --filter .md --open-cmd '$OPEN {}'; herdr pane close $PANE_ID"
+herdr pane run "$PANE_ID" "ashiato --filter .md --open-cmd '$OPEN {}' --alt-open-cmd '$ALT_OPEN'; herdr pane close $PANE_ID"

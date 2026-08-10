@@ -117,7 +117,7 @@ ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまと
 
 ディレクトリ解決の優先順位: 明示引数 → herdr（`HERDR_ENV=1` のとき worktree ルート、なければ同ワークスペースのエージェントの cwd）→ カレントディレクトリ。ashiato 自身は herdr に依存せず、エージェントとの接続はラッパー側の責務です。
 
-このリポジトリはそのまま [herdr プラグイン](herdr-plugin.toml) です: `herdr plugin link <このリポジトリ>` で `ashiato.open` アクション（横分割ピッカー）が登録され、`[[keys.command]] type = "plugin_action"` でキーに割り当てられます。**流儀**: herdr 連携コードはツールのリポジトリに plugin として同居させる（akapen の `akp` プラグインも同じ）。
+このリポジトリはそのまま [herdr プラグイン](herdr-plugin.toml) です: `herdr plugin link <このリポジトリ>` で `ashiato.open` アクション（横分割ピッカー）が登録され、`[[keys.command]] type = "plugin_action"` でキーに割り当てられます。ピッカー内では Enter で akapen、`o` で yazi が開きます（`scripts/ashiato-pane.sh` の `ASHIATO_OPEN_CMD` / `ASHIATO_ALT_OPEN_CMD` で差し替え可）。**流儀**: herdr 連携コードはツールのリポジトリに plugin として同居させる（akapen の `akp` プラグインも同じ）。
 
 ## 設計メモ
 

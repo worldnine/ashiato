@@ -431,8 +431,10 @@ ashiato 側の `o` キー（`--alt-open-cmd`）と組み合わせると、ashiat
 # `herdr agent prompt <pane> <text>` で送信する（argv 直接渡し、シェル非経由）。
 # 0件・複数で曖昧なら赤トーストで拒否し、コメントは保持される。
 
-ashiato . --open-cmd "akapen {} --send-agent"
+ashiato . --open-cmd "akapen {} --send-agent" --alt-open-cmd "yazi {}"
 ```
+
+`--alt-open-cmd` は `o` キー用。herdr プラグイン（`scripts/ashiato-pane.sh`）は既定で `yazi {}` を渡し、`ASHIATO_ALT_OPEN_CMD` で差し替え可能。
 
 > **2026-08-05 決定**: 当初案の `--send-cmd 'herdr pane run ...'` 方式は、
 > `herdr pane run` がコマンド引数必須で stdin を読まない（usage エラーになる）ため

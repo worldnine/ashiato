@@ -119,7 +119,7 @@ ashiato --files --since 1w --filter .md | xargs akapen  # review this week's mar
 
 Directory resolution order: explicit argument → herdr (`HERDR_ENV=1`: worktree root, else the workspace agent's cwd) → current directory. ashiato itself does not depend on herdr; wiring it to an agent is the wrapper's job.
 
-The repo is also a [herdr plugin](herdr-plugin.toml): `herdr plugin link <this repo>` registers the `ashiato.open` action (side-split picker; bind it to a key via `[[keys.command]] type = "plugin_action"`). Convention: herdr integration code lives in the tool's repo as a plugin — see also akapen's `akp` plugin.
+The repo is also a [herdr plugin](herdr-plugin.toml): `herdr plugin link <this repo>` registers the `ashiato.open` action (side-split picker; bind it to a key via `[[keys.command]] type = "plugin_action"`). Inside the picker, Enter opens akapen and `o` opens yazi (swap via `ASHIATO_OPEN_CMD` / `ASHIATO_ALT_OPEN_CMD` in `scripts/ashiato-pane.sh`). Convention: herdr integration code lives in the tool's repo as a plugin — see also akapen's `akp` plugin.
 
 ## Design notes
 

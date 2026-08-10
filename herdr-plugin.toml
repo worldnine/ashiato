@@ -7,7 +7,7 @@ id = "ashiato"
 name = "ashiato"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Open the ashiato markdown picker in a side pane (akapen --send-agent)"
+description = "Open the ashiato markdown picker in a side pane (Enter = akapen --send-agent, o = yazi)"
 platforms = ["linux", "macos"]
 
 [[actions]]
