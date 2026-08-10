@@ -413,14 +413,19 @@ prepend_keymap = [
   # g f: 現在のディレクトリを ashiato で開いて akapen レビューループ
   { on = [ "g", "f" ], run = "shell 'ashiato . --open-cmd akapen' --block", desc = "Flat mtime picker → akapen" },
   # A: ashiato で時間順に選んだファイルへジャンプ（ya emit reveal）
-  { on = "A", run = 'shell --block -- p=$(ashiato 2>/dev/null | head -1); [ -n "$p" ] && ya emit reveal "$p"', desc = "ashiato → reveal" },
+  # 現行ディレクトリを明示指定: 移動後に A を押すと「今いる場所」を再スキャン
+  # （引数なしだと herdr 環境で worktree ルートに飛んでしまう）
+  { on = "A", run = 'shell --block -- p=$(ashiato "$PWD" 2>/dev/null | head -1); [ -n "$p" ] && ya emit reveal "$p"', desc = "ashiato → reveal" },
   # R: 選択ファイルを akapen でレビュー
   { on = "R", run = "shell 'akapen %s --send-agent' --block", desc = "akapen review" },
 ]
 ```
 
 ashiato 側の `o` キー（`--alt-open-cmd`）と組み合わせると、ashiato ⇄ yazi の往復
-（Enter = akapen、`o` = yazi）が 1 つのループで回る。
+（Enter = akapen、`o` = yazi）が 1 つのループで回る。`A` は現行ディレクトリを
+明示的に渡すため、yazi でディレクトリを移動してから `A` を押すと「今いる場所」
+の時間ブラウザが開き、Enter でそのファイルにジャンプして yazi に戻る
+（ashiato → yazi → 移動 → ashiato → … のリベースループ）。
 
 ### herdr ラッパーでの akapen 連携
 
