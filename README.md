@@ -35,6 +35,7 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `--show-hidden` | show dot-directories at startup (`Ctrl+h` toggles) |
 | `--show-dirs` | show directories at startup (`d` toggles) |
 | `--open-cmd <cmd>` | command `Enter` launches with the selection (`{}` / `{1}`… placeholders). Blocks until it exits, then rescans — the review-loop mode |
+| `--alt-open-cmd <cmd>` | command `o` launches with the selection (same `{}` / `{1}`… placeholders; blocks then rescans). Without it, `o` is a dead key |
 | `--filter <text>` | initial filter (same matching as `/`; e.g. `--filter .md`) |
 | `--preview <on\|off\|auto>` | preview pane; `auto` (default) hides it under 80 columns |
 | `--theme <name>` | syntect theme (two-face name or `.tmTheme` path; default `Catppuccin Mocha`, `Solarized (light)` when light is detected) |
@@ -53,6 +54,7 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `j` / `k`, `g` / `G`, `PgUp` / `PgDn`, `Ctrl+u` / `Ctrl+d` | move |
 | `Space` | select / deselect a file |
 | `Enter` | print selection to stdout and exit — or launch `--open-cmd`, block, rescan |
+| `o` | launch `--alt-open-cmd`, block, rescan (dead key without it) |
 | `y` | copy full path(s) to the clipboard |
 | `/` | incremental filter (substring match on the relative path) |
 | `\` | toggle the filter off/on without erasing it (`:nohlsearch` model) |
@@ -92,6 +94,13 @@ With `--open-cmd`, `Enter` launches your reviewer with the selected files, block
 
 ```sh
 ashiato . --open-cmd "akapen {} --send-agent"
+```
+
+Pair it with `--alt-open-cmd` and the `o` key runs a second command in the same flow — keep the direct review loop (Enter = akapen) and still jump into a file manager:
+
+```sh
+ashiato . --open-cmd "akapen {} --send-agent" --alt-open-cmd "yazi {}"
+# Enter = akapen review → rescan, o = open in yazi (rescan on quit)
 ```
 
 ## fzf interop (`--files`)

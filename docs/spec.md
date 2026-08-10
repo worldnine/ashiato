@@ -27,6 +27,7 @@ ashiato [directory] [flags]
 | `--show-hidden` | false | 隠し**ディレクトリ**（`.claude/` 等 `.` 始まりのディレクトリ）配下を表示。ドット**ファイル**（`.gitignore` 等）は常に表示（例レイアウト参照。`.DS_Store` のみ常時除外） |
 | `--show-dirs` | false | ディレクトリを表示 |
 | `--open-cmd <command>` | —（なし） | Enter で起動するコマンド。選択ファイルが引数に渡される。**未指定時は Enter が選択パスを stdout に出力して即終了**（既定動作 = 出力モード） |
+| `--alt-open-cmd <command>` | —（なし） | `o` キーで起動するコマンド。`--open-cmd` と同じプレースホルダ・ブロック → 再スキャン。未指定時は `o` は無効キー（`no --alt-open-cmd` をフラッシュ） |
 | `--filter <text>` | —（空） | 初期フィルタ（`/` と同じマッチング）。例: `--filter .md` で md ファイルのみ表示。起動後は `\` で一時解除・復帰、`/` で編集・解除可 |
 | `--preview <on\|off\|auto>` | `auto` | プレビューペインの表示。`auto` はターミナル幅が 80 列未満だと非表示（リストが全幅に） |
 | `--files` | — | TUI を開かず、収集・ソート済みのパス一覧を stdout に出力して終了（パイプ / fzf 用のデータソース） |
@@ -282,6 +283,7 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 |---|---|
 | `Space` | ファイルを選択/解除（トグル） |
 | `Enter` | `--open-cmd` 指定時: 選択ファイルをそのコマンドで起動し、終了までブロック → 一覧を再スキャン。未指定時: 選択パスを stdout に出力して即終了 |
+| `o` | `--alt-open-cmd` 指定時: 選択ファイルをそのコマンドで起動し、終了までブロック → 一覧を再スキャン（Enter と同じフロー）。未指定時は無効（`no --alt-open-cmd` をフラッシュ） |
 | `y` | 選択ファイル（またはカーソル位置のファイル）のフルパスをクリップボードにコピー |
 
 ### フィルタ・ソート
@@ -319,11 +321,11 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 
 ---
 
-## 複数選択 → 子プロセス起動のフロー（`--open-cmd` 指定時のみ）
+## 複数選択 → 子プロセス起動のフロー（`--open-cmd` / `--alt-open-cmd` 指定時のみ）
 
 ```
 1. Space でファイルを選択（複数可）
-2. Enter → ashiato は子プロセスとして --open-cmd を起動
+2. Enter（または `o`）→ ashiato は子プロセスとして --open-cmd（`o` は --alt-open-cmd）を起動
    例: akapen /path/a.md /path/b.rs /path/c.toml
 3. ashiato は子プロセスの終了を待つ（ブロック）
 4. 子プロセス終了 → ファイル一覧を再スキャン
@@ -331,7 +333,7 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 5. ashiato の TUI に復帰
 ```
 
-`--open-cmd` 未指定時はこのフロー自体がなく、Enter は出力モード（下記）。
+`--open-cmd` も `--alt-open-cmd` も未指定時はこのフロー自体がなく、Enter は出力モード（下記）。
 
 ---
 
@@ -405,12 +407,20 @@ herdr agent list 2>/dev/null
 ### yazi からの呼び出し
 
 ```toml
-# ~/.config/yazi/keymap.toml
-[[manager.prepend_keymap]]
-on   = [ "g", "f" ]
-run  = "shell 'ashiato . --open-cmd akapen' --block"
-desc = "Flat mtime picker → akapen"
+# ~/.config/yazi/keymap.toml（現行 yazi の [mgr] 構文）
+[mgr]
+prepend_keymap = [
+  # g f: 現在のディレクトリを ashiato で開いて akapen レビューループ
+  { on = [ "g", "f" ], run = "shell 'ashiato . --open-cmd akapen' --block", desc = "Flat mtime picker → akapen" },
+  # A: ashiato で時間順に選んだファイルへジャンプ（ya emit reveal）
+  { on = "A", run = 'shell --block -- p=$(ashiato 2>/dev/null | head -1); [ -n "$p" ] && ya emit reveal "$p"', desc = "ashiato → reveal" },
+  # R: 選択ファイルを akapen でレビュー
+  { on = "R", run = "shell 'akapen %s --send-agent' --block", desc = "akapen review" },
+]
 ```
+
+ashiato 側の `o` キー（`--alt-open-cmd`）と組み合わせると、ashiato ⇄ yazi の往復
+（Enter = akapen、`o` = yazi）が 1 つのループで回る。
 
 ### herdr ラッパーでの akapen 連携
 

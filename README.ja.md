@@ -35,6 +35,7 @@ ashiato [directory] [flags]
 | `--show-hidden` | 起動時にドットディレクトリを表示（`Ctrl+h` で切替） |
 | `--show-dirs` | 起動時にディレクトリを表示（`d` で切替） |
 | `--open-cmd <cmd>` | Enter で起動するコマンド（`{}` / `{1}`.. プレースホルダ可）。終了までブロック → 再スキャン（レビューループ用） |
+| `--alt-open-cmd <cmd>` | `o` キーで起動するコマンド（`--open-cmd` と同じ `{}` / `{1}`.. プレースホルダ・ブロック → 再スキャン。未指定時は `o` は無効） |
 | `--filter <text>` | 初期フィルタ（`/` と同じマッチング。例: `--filter .md`） |
 | `--preview <on\|off\|auto>` | プレビューペイン。`auto`（既定）は 80 列未満で非表示 |
 | `--theme <name>` | syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス。既定 `Catppuccin Mocha`、light 検出時 `Solarized (light)`） |
@@ -53,6 +54,7 @@ ashiato [directory] [flags]
 | `j` / `k`, `g` / `G`, `PgUp` / `PgDn`, `Ctrl+u` / `Ctrl+d` | 移動 |
 | `Space` | ファイルを選択/解除 |
 | `Enter` | 選択パスを stdout に出力して終了 — または `--open-cmd` を起動・ブロック・再スキャン |
+| `o` | `--alt-open-cmd` を起動・ブロック・再スキャン（`--alt-open-cmd` 未指定時は無効） |
 | `y` | フルパスをクリップボードへコピー |
 | `/` | インクリメンタルフィルタ（相対パスへの substring 一致） |
 | `\` | フィルタのテキストを保持したまま ON/OFF トグル（`:nohlsearch` モデル） |
@@ -90,6 +92,13 @@ ashiato は xterm フォーカスレポート（DECSET 1004）でターミナル
 
 ```sh
 ashiato . --open-cmd "akapen {} --send-agent"
+```
+
+`--alt-open-cmd` を併用すると `o` キーで別のコマンドも同じフローで起動できます — 直行のレビューループ（Enter = akapen）を保ちつつ、ファイラへも飛べます:
+
+```sh
+ashiato . --open-cmd "akapen {} --send-agent" --alt-open-cmd "yazi {}"
+# Enter = akapen でレビュー → 再スキャン、o = yazi で開く（q で抜けると再スキャン）
 ```
 
 ## fzf 相互運用（`--files`）

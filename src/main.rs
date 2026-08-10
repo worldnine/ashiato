@@ -9,7 +9,9 @@
 //! toggles directories, `y` copies paths. Without `--open-cmd`, Enter
 //! prints the selected paths to stdout and exits (generic picker, fzf
 //! model); with it, Enter launches the command, blocks, and rescans
-//! (the akapen review-loop flow).
+//! (the akapen review-loop flow). With `--alt-open-cmd`, the `o` key runs
+//! a second command in the same blocking + rescan flow (e.g. Enter =
+//! akapen review, `o` = yazi).
 //!
 //! Away-diff (terminal focus reporting): while the terminal is
 //! unfocused, external edits accumulate in a stack; the rows keep their
@@ -100,6 +102,10 @@ struct Config {
     /// placeholders. `None` (the default) = Enter prints the selected
     /// paths to stdout and exits (generic picker, fzf model).
     open_cmd: Option<String>,
+    /// `--alt-open-cmd <command>`: the `o` key spawns this with the same
+    /// `{}` / `{1}` placeholders and blocking + rescan flow as Enter's
+    /// `--open-cmd`. `None` (the default) = `o` is a dead key.
+    alt_open_cmd: Option<String>,
     /// `--filter <text>`: initial filter applied at startup (same
     /// matching as the `/` key; empty = no filter).
     filter: String,
@@ -268,6 +274,7 @@ impl Config {
         let mut show_hidden = false;
         let mut show_dirs = false;
         let mut open_cmd: Option<String> = None;
+        let mut alt_open_cmd: Option<String> = None;
         let mut filter = String::new();
         let mut preview = PreviewMode::Auto;
         let mut files = false;
@@ -295,6 +302,7 @@ impl Config {
                     };
                 }
                 "--open-cmd" => open_cmd = Some(flag_value(&mut it, "--open-cmd")?),
+                "--alt-open-cmd" => alt_open_cmd = Some(flag_value(&mut it, "--alt-open-cmd")?),
                 "--filter" => filter = flag_value(&mut it, "--filter")?,
                 "--preview" => {
                     let v = flag_value(&mut it, "--preview")?;
@@ -332,12 +340,16 @@ impl Config {
         if output && open_cmd.is_some() {
             bail!("--output and --open-cmd are mutually exclusive");
         }
+        if output && alt_open_cmd.is_some() {
+            bail!("--output and --alt-open-cmd are mutually exclusive");
+        }
         Ok(Action::Run(Config {
             dir,
             sort,
             show_hidden,
             show_dirs,
             open_cmd,
+            alt_open_cmd,
             filter,
             preview,
             files,
@@ -382,6 +394,9 @@ fn main() -> Result<()> {
                  \x20 --open-cmd <command> Enter spawns this with the selected files\n\
                  \x20                   (none by default — Enter prints the paths to\n\
                  \x20                   stdout and exits; {} = all paths, {1}.. per-file)\n\
+                 \x20 --alt-open-cmd <command> the `o` key spawns this (same {} placeholders,\n\
+                 \x20                   blocking + rescan flow; without it `o` is a\n\
+                 \x20                   dead key)\n\
                  \x20 --filter <text>   initial filter (same matching as `/`,\n\
                  \x20                   e.g. `.md` for markdown only)\n\
                  \x20 --preview <on|off|auto>  preview pane (default auto:\n\
@@ -402,6 +417,7 @@ fn main() -> Result<()> {
                  \x20 j/k/arrows     move   g/G  top/bottom\n\
                  \x20 PgUp/PgDn Ctrl+u/Ctrl+d  half page\n\
                  \x20 Space          select/unselect   Enter  open (blocks, then rescan)\n\
+                 \x20 o              open with --alt-open-cmd (blocks, then rescan)\n\
                  \x20 y              copy full paths to clipboard\n\
                  \x20 /              incremental filter (Enter apply, Esc clear)\n\
                  \x20 \\              toggle the filter off/on (text is kept)\n\
@@ -1495,6 +1511,7 @@ fn on_key(
             }
         }
         KeyCode::Enter => open_selection(app, terminal),
+        KeyCode::Char('o') => open_selection_alt(app, terminal),
         KeyCode::Char('y') => copy_paths(app),
         KeyCode::Char('/') => app.filter_active = true,
         KeyCode::Char('t') => {
@@ -1653,7 +1670,7 @@ fn on_filter_key(
 /// Enter: with `--open-cmd` given, hand the target files to it (blocking),
 /// then rescan; without one (or with `--output`) queue the paths for
 /// stdout and exit — the generic picker behavior.
-fn open_selection(app: &mut App, mut terminal: Option<&mut TermGuard>) {
+fn open_selection(app: &mut App, terminal: Option<&mut TermGuard>) {
     let paths = app.target_paths();
     if paths.is_empty() {
         app.flash_err("no files");
@@ -1665,6 +1682,30 @@ fn open_selection(app: &mut App, mut terminal: Option<&mut TermGuard>) {
         return;
     }
     let cmd = expand_cmd(app.config.open_cmd.as_deref().expect("checked above"), &paths);
+    open_with_cmd(app, terminal, &cmd);
+}
+
+/// `o`: with `--alt-open-cmd` given, hand the target files to it in the
+/// same blocking + rescan flow as Enter's `--open-cmd`; without one the
+/// key is dead — flash an error and keep running.
+fn open_selection_alt(app: &mut App, terminal: Option<&mut TermGuard>) {
+    let Some(cmd) = app.config.alt_open_cmd.clone() else {
+        app.flash_err("no --alt-open-cmd");
+        return;
+    };
+    let paths = app.target_paths();
+    if paths.is_empty() {
+        app.flash_err("no files");
+        return;
+    }
+    let cmd = expand_cmd(&cmd, &paths);
+    open_with_cmd(app, terminal, &cmd);
+}
+
+/// Shared child flow for `--open-cmd` / `--alt-open-cmd`: suspend the TUI
+/// while the child owns the terminal, block until it exits, then re-enter
+/// the TUI and rescan.
+fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str) {
     if let Some(g) = terminal.as_deref_mut() {
         // Suspend the TUI while the child owns the terminal (akapen's
         // editor pattern): leave the alternate screen and raw mode, and
@@ -2084,6 +2125,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         hint("d", "dirs"),
         hint("q", "quit"),
     ];
+    if app.config.alt_open_cmd.is_some() {
+        footer2.push(hint("o", "open-alt"));
+    }
     if app.git.is_some() {
         footer2.push(hint("u", "uncommitted"));
     }
@@ -2461,6 +2505,11 @@ mod tests {
             ["--output".to_string(), "--open-cmd".to_string(), "x".to_string()]
         )
         .is_err());
+        // Same for the `o`-key command.
+        assert!(Config::parse(
+            ["--output".to_string(), "--alt-open-cmd".to_string(), "x".to_string()]
+        )
+        .is_err());
         assert!(run_config(&["--output"]).output);
     }
 
@@ -2490,6 +2539,7 @@ mod tests {
         assert_eq!(c.dir, None); // herdr → cwd resolution
         assert_eq!(c.sort, Sort::MtimeDesc);
         assert_eq!(c.open_cmd, None);
+        assert_eq!(c.alt_open_cmd, None);
     }
 
     #[test]
@@ -2667,6 +2717,16 @@ mod tests {
         assert_eq!(c.open_cmd.as_deref(), Some("vim -p {}"));
         // A bare `--open-cmd` with no value is an error.
         assert!(Config::parse(["--open-cmd".to_string()]).is_err());
+    }
+
+    #[test]
+    fn alt_open_cmd_is_optional() {
+        let c = run_config(&["--alt-open-cmd", "yazi {}"]);
+        assert_eq!(c.alt_open_cmd.as_deref(), Some("yazi {}"));
+        // Default: none — the `o` key is a dead key.
+        assert_eq!(run_config(&[]).alt_open_cmd, None);
+        // A bare `--alt-open-cmd` with no value is an error.
+        assert!(Config::parse(["--alt-open-cmd".to_string()]).is_err());
     }
 
     #[test]
@@ -3457,6 +3517,44 @@ mod tests {
         assert!(ansi.contains("\x1b[?1049h"), "EnterAlternateScreen missing: {ansi:?}");
         assert!(ansi.contains("\x1b[?25l"), "Hide missing: {ansi:?}");
         assert!(ansi.contains("\x1b[?1000h"), "EnableMouseCapture missing: {ansi:?}");
+    }
+
+    #[test]
+    fn open_selection_alt_rescans_and_reports_done_after_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "1").unwrap();
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.config.alt_open_cmd = Some("true".to_string());
+        app.rescan();
+        let c = dir.path().join("c.md");
+        std::fs::write(&c, "3").unwrap();
+        open_selection_alt(&mut app, None);
+        assert!(
+            app.files.iter().any(|e| e.path == c),
+            "rescan after the child exit picks up external edits"
+        );
+        assert_eq!(
+            app.status.as_ref().map(|(m, _, err)| (m.as_str(), *err)),
+            Some(("done — list rescanned", false))
+        );
+        assert!(app.running);
+    }
+
+    #[test]
+    fn o_key_is_a_dead_key_without_alt_open_cmd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "1").unwrap();
+        let mut app = test_app(Vec::new());
+        app.root = dir.path().to_path_buf();
+        app.rescan();
+        app.config.alt_open_cmd = None;
+        open_selection_alt(&mut app, None);
+        assert_eq!(
+            app.status.as_ref().map(|(m, _, err)| (m.as_str(), *err)),
+            Some(("no --alt-open-cmd", true))
+        );
+        assert!(app.running);
     }
 
     #[test]
