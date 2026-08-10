@@ -416,8 +416,24 @@ prepend_keymap = [
   # 現行ディレクトリを明示指定: 移動後に A を押すと「今いる場所」を再スキャン
   # （引数なしだと herdr 環境で worktree ルートに飛んでしまう）
   { on = "A", run = 'shell --block -- p=$(ashiato "$PWD" 2>/dev/null | head -1); [ -n "$p" ] && ya emit reveal "$p"', desc = "ashiato → reveal" },
-  # R: 選択ファイルを akapen でレビュー
-  { on = "R", run = "shell 'akapen %s --send-agent' --block", desc = "akapen review" },
+  # R: 選択ファイルを akapen でレビュー（種別問わず強制、Esc で yazi に即復帰）
+  { on = "R", run = "shell 'akapen %s --send-agent --esc-quit always' --block", desc = "akapen review" },
+]
+```
+
+種別ごとのディスパッチは `~/.config/yazi/yazi.toml` の opener ルールに任せる
+（ashiato 側には増やさない）:
+
+```toml
+[opener]
+akapen = [
+  { run = "akapen %s --send-agent --esc-quit always", desc = "akapen review", block = true },
+]
+
+[open]
+prepend_rules = [
+  # md → akapen（Enter でレビュー、O で edit も選べる）
+  { url = "*.md", use = [ "akapen", "edit" ] },
 ]
 ```
 
