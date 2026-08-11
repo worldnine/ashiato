@@ -39,6 +39,7 @@ mod git;
 mod herdr;
 mod highlight;
 mod preview;
+pub mod readlog;
 mod theme;
 
 use std::collections::{BTreeSet, HashSet};
