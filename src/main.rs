@@ -912,7 +912,10 @@ impl App {
         self.read_sig = sigs;
         let merged = collect_read_logs(&self.read_cache);
         // LogData は契約上 PartialEq を持たないのでフィールド比較する。
-        if merged.reads == self.read_log.reads && merged.edits == self.read_log.edits {
+        if merged.reads == self.read_log.reads
+            && merged.edits == self.read_log.edits
+            && merged.refs == self.read_log.refs
+        {
             return; // 何も変わっていない: 行もビューも触らない
         }
         self.read_log = merged;
@@ -1163,12 +1166,16 @@ fn collect_read_logs(cache: &HashMap<PathBuf, readlog::LogData>) -> readlog::Log
     for data in cache.values() {
         merged.reads.extend(data.reads.iter().cloned());
         merged.edits.extend(data.edits.iter().cloned());
+        merged.refs.extend(data.refs.iter().cloned());
     }
     merged
         .reads
         .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.path.cmp(&b.path)));
     merged
         .edits
+        .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.path.cmp(&b.path)));
+    merged
+        .refs
         .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.path.cmp(&b.path)));
     merged
 }
@@ -2764,6 +2771,10 @@ fn read_line(
         }
     };
     push_right(format!("×{}", row.read_count), badge_style);
+    if row.ref_count > 0 {
+        // bash 参照（機械抽出）は read と区別して薄く出す。
+        push_right(format!("~{}", row.ref_count), badge_style);
+    }
     if row.edited {
         push_right("●".to_string(), badge_style);
     }

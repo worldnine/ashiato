@@ -216,11 +216,15 @@ pub struct ReadRow {
     /// スキャンエントリ（`entries`）へのインデックス。行のファイル情報は
     /// ここから引く（read ビューも既存のファイル行と同じレイアウト）。
     pub idx: usize,
-    /// 最後に read された時刻（行の時刻表示・ソート・クラスタ基準）。
+    /// 最後に触れられた時刻（read と bash 参照のうち最新。行の時刻表示・
+    /// ソート・クラスタ基準）。
     pub last_read: SystemTime,
     /// 畳み込み後の read 回数（`×N` バッジ）。
     pub read_count: usize,
+    /// bash コマンドに現れた回数（`~N` バッジ。機械抽出の参考値）。
+    pub ref_count: usize,
     /// read 後に Edit/Write されたファイル（`●` マーカー）。
+    /// 「後」は最初の接触（read または bash 参照）以降の意味。
     pub edited: bool,
     /// read 時刻基準のクラスタ（Today/Yesterday/日付）。
     pub cluster: Cluster,
@@ -229,12 +233,13 @@ pub struct ReadRow {
 /// read ログ（`filter_root` 済み・複数ログをマージ済み）から表示行を
 /// 構築する純関数。
 ///
-/// - 表示対象: read されたファイルのうち、現在のスキャン `entries` に
-///   存在するものだけ（消えたファイルは出さない）。
-/// - ソート: read 時刻降順（最後に read された順 — 再 read で上に浮く）。
-///   タイは相対パスで決定的に。
-/// - 行ごとに: 最後の read 時刻 / 畳み込み後回数 / read 後編集マーカー /
-///   read 時刻基準のクラスタを計算する。
+/// - 表示対象: read されたファイルと bash 参照されたファイルのうち、現在の
+///   スキャン `entries` に存在するものだけ（消えたファイルは出さない。
+///   bash 参照の候補はここで実在チェックされ、`ls` や存在しないパスは消える）。
+/// - ソート: 最後に触れられた時刻降順（read と参照のうち最新 — 再 read や
+///   参照で上に浮く）。タイは相対パスで決定的に。
+/// - 行ごとに: read 回数 / bash 参照回数 / read 後編集マーカー /
+///   触れられた時刻基準のクラスタを計算する。
 pub fn build_read_rows(
     log: &LogData,
     entries: &[FileEntry],
@@ -245,13 +250,15 @@ pub fn build_read_rows(
     for (i, e) in entries.iter().enumerate() {
         idx_of.insert(e.rel.as_path(), i);
     }
-    // パスごとの集約（read 回数・最初/最後の read 時刻）。
-    let mut acc: HashMap<PathBuf, (usize, SystemTime, SystemTime)> = HashMap::new();
+    // パスごとの集約: (read 回数, 最初の read, 最後の read, 参照回数, 最後の参照)。
+    let mut acc: HashMap<PathBuf, (usize, SystemTime, SystemTime, usize, SystemTime)> =
+        HashMap::new();
     for r in &log.reads {
         if !idx_of.contains_key(r.path.as_path()) {
             continue; // スキャンに存在しないファイルは表示しない
         }
-        let (count, first, last) = acc.entry(r.path.clone()).or_insert((0, r.at, r.at));
+        let (count, first, last, _, _) =
+            acc.entry(r.path.clone()).or_insert((0, r.at, r.at, 0, r.at));
         *count += 1;
         if r.at < *first {
             *first = r.at;
@@ -260,24 +267,40 @@ pub fn build_read_rows(
             *last = r.at;
         }
     }
-    // 編集マーカー: 「read 後に Edit/Write された」= 編集時刻が最初の
-    // read 時刻以降にある（read してから手が入れられたファイル）。
+    // bash 参照（機械抽出の候補）も read と同じく「触れた」として集約する。
+    for r in &log.refs {
+        if !idx_of.contains_key(r.path.as_path()) {
+            continue;
+        }
+        let (_, _, _, ref_count, ref_last) =
+            acc.entry(r.path.clone()).or_insert((0, r.at, r.at, 0, r.at));
+        *ref_count += 1;
+        if r.at > *ref_last {
+            *ref_last = r.at;
+        }
+    }
+    // 編集マーカー: 「触れた後に Edit/Write された」= 編集時刻が最初の接触
+    // （read または bash 参照）以降にある。read してから手が入れられた
+    // ファイル — レビューで一番知りたい組み合わせ。
     let mut edited: HashSet<PathBuf> = HashSet::new();
     for e in &log.edits {
-        if acc.get(&e.path).is_some_and(|&(_, first, _)| e.at >= first) {
+        if acc.get(&e.path).is_some_and(|&(_, first, _, _, _)| e.at >= first) {
             edited.insert(e.path.clone());
         }
     }
     let mut rows: Vec<ReadRow> = acc
         .iter()
-        .filter_map(|(path, &(count, _, last))| {
+        .filter_map(|(path, &(count, _, last, ref_count, ref_last))| {
             let &idx = idx_of.get(path.as_path())?;
+            // 行の時刻は「最後に触れた」= read と参照のうち最新。
+            let last_touch = last.max(ref_last);
             Some(ReadRow {
                 idx,
-                last_read: last,
+                last_read: last_touch,
                 read_count: count,
+                ref_count,
                 edited: edited.contains(path),
-                cluster: cluster_of(to_local(last), now),
+                cluster: cluster_of(to_local(last_touch), now),
             })
         })
         .collect();
@@ -788,16 +811,18 @@ mod tests {
         let pi = crate::readlog::filter_root(pi, root);
         log.reads.extend(pi.reads);
         log.edits.extend(pi.edits);
+        log.refs.extend(pi.refs);
         log
     }
 
     /// fixture の read 対象がスキャンに存在するツリー（+ ログに出ない
-    /// src/other.rs）。時刻は表示対象の存在判定にのみ使う。
+    /// src/other.rs + bash 参照のみの Cargo.toml）。時刻は表示対象の存在判定にのみ使う。
     fn fixture_entries() -> Vec<FileEntry> {
         vec![
             entry("src/main.rs", t(1_700_000_000)),
             entry("src/files.rs", t(1_700_000_000)),
             entry("README.md", t(1_700_000_000)),
+            entry("Cargo.toml", t(1_700_000_000)),
             entry("src/other.rs", t(1_700_000_000)),
         ]
     }
@@ -811,19 +836,25 @@ mod tests {
         let max_read = log.reads.iter().map(|r| r.at).max().expect("fixture reads");
         let now = to_local(max_read) + chrono::Duration::hours(1);
         let rows = build_read_rows(&log, &entries, now);
-        // 表示行: read 時刻降順 = files.rs (01:14Z) → main.rs (01:12Z) →
-        // README.md (01:10:05Z)。ログに出ない src/other.rs は出ない。
+        // 表示行: 「最後に触れた」降順 = main.rs (01:15Z bash 参照) →
+        // files.rs (01:14Z read) → README.md (01:10:05Z read) →
+        // Cargo.toml (01:07Z 参照のみ・read なしでも表示)。ログに出ない
+        // src/other.rs は出ない。
         let rels: Vec<&str> = rows
             .iter()
             .map(|r| entries[r.idx].rel.to_str().unwrap())
             .collect();
-        assert_eq!(rels, vec!["src/files.rs", "src/main.rs", "README.md"]);
-        // 各バッジ: 畳み込み後 read 回数と「read 後に Edit/Write された」マーカー。
+        assert_eq!(
+            rels,
+            vec!["src/main.rs", "src/files.rs", "README.md", "Cargo.toml"]
+        );
+        // 各バッジ: 畳み込み後 read 回数 / bash 参照回数 /「read 後に Edit/Write」マーカー。
         let main = rows
             .iter()
             .find(|r| entries[r.idx].rel == Path::new("src/main.rs"))
             .expect("main.rs row");
         assert_eq!(main.read_count, 4, "claude 2 + pi 2（畳み込み後）");
+        assert_eq!(main.ref_count, 1, "pi の sed 参照");
         assert!(
             main.edited,
             "read 後に Edit されている（claude 01:01Z / pi 01:10:30Z）"
@@ -833,14 +864,24 @@ mod tests {
             .find(|r| entries[r.idx].rel == Path::new("src/files.rs"))
             .expect("files.rs row");
         assert_eq!(files.read_count, 2, "claude 1 + pi 1");
+        assert_eq!(files.ref_count, 0);
         assert!(!files.edited);
         let readme = rows
             .iter()
             .find(|r| entries[r.idx].rel == Path::new("README.md"))
             .expect("README row");
         assert_eq!(readme.read_count, 2, "claude 1 + pi 1");
+        assert_eq!(readme.ref_count, 1, "claude の grep 参照");
         assert!(!readme.edited);
-        // クラスタは read 時刻基準（全 read が now の 1 時間以内 → Today）。
+        // read なし・bash 参照のみのファイルも行になる（~N バッジのみ）。
+        let cargo = rows
+            .iter()
+            .find(|r| entries[r.idx].rel == Path::new("Cargo.toml"))
+            .expect("Cargo.toml row");
+        assert_eq!(cargo.read_count, 0);
+        assert_eq!(cargo.ref_count, 1, "claude の cat 参照");
+        assert!(!cargo.edited);
+        // クラスタは触れられた時刻基準（全イベントが now の 1 時間以内 → Today）。
         assert!(rows.iter().all(|r| r.cluster == Cluster::Today));
     }
 
@@ -857,7 +898,7 @@ mod tests {
             .iter()
             .map(|r| entries[r.idx].rel.to_str().unwrap())
             .collect();
-        assert_eq!(rels, vec!["src/main.rs", "README.md"]);
+        assert_eq!(rels, vec!["src/main.rs", "README.md", "Cargo.toml"]);
     }
 
     #[test]
@@ -882,6 +923,7 @@ mod tests {
                 },
             ],
             edits: Vec::new(),
+            ..Default::default()
         };
         let entries = vec![
             entry("now.rs", to(local(2026, 8, 11, 13, 0))),

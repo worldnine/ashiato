@@ -44,11 +44,21 @@ pub struct EditRecord {
     pub at: SystemTime,
 }
 
+/// エージェントによる 1 回の bash 参照: コマンド文字列にパスが現れた。
+/// Read と違い「内容を読んだ」保証はない — 機械抽出の参考値（`~N` バッジ）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferRecord {
+    pub path: PathBuf,
+    pub at: SystemTime,
+}
+
 /// ログ 1 本ぶん（または backend 横断マージ後）の読み出し結果。時系列順。
 #[derive(Clone, Debug, Default)]
 pub struct LogData {
     pub reads: Vec<ReadRecord>,
     pub edits: Vec<EditRecord>,
+    /// bash コマンド文字列に現れたパスの候補（機械抽出・同一コマンド内は重複なし）。
+    pub refs: Vec<ReferRecord>,
 }
 
 /// root に関連するセッションログを発見する。backend ごとに最大 1 つ返す
@@ -167,16 +177,32 @@ pub fn parse_log(path: &Path, backend: Backend) -> anyhow::Result<LogData> {
         let Some(items) = rec.pointer("/message/content").and_then(Value::as_array) else { continue };
         for item in items {
             let Some(kind) = tool_kind(item, backend) else { continue };
-            let Some(path_str) = tool_path(item, backend) else { continue };
-            // JSON の文字列は常に UTF-8 なので非 UTF-8 パスは構造的に混入しない。
-            // 相対パスは root と突き合わせられないのでスキップする。
-            let path = PathBuf::from(path_str);
-            if !path.is_absolute() {
-                continue;
-            }
             match kind {
-                ToolKind::Read => data.reads.push(ReadRecord { path, at }),
-                ToolKind::Edit => data.edits.push(EditRecord { path, at }),
+                ToolKind::Read => {
+                    let Some(path_str) = tool_path(item, backend) else { continue };
+                    // JSON の文字列は常に UTF-8 なので非 UTF-8 パスは構造的に混入しない。
+                    // 相対パスは root と突き合わせられないのでスキップする。
+                    let path = PathBuf::from(path_str);
+                    if path.is_absolute() {
+                        data.reads.push(ReadRecord { path, at });
+                    }
+                }
+                ToolKind::Edit => {
+                    let Some(path_str) = tool_path(item, backend) else { continue };
+                    let path = PathBuf::from(path_str);
+                    if path.is_absolute() {
+                        data.edits.push(EditRecord { path, at });
+                    }
+                }
+                ToolKind::Bash => {
+                    // bash の command 文字列から機械的にパス候補を抽出する。
+                    // 相対パス（`grep x README.md` 等）はここでは保持し、後段の
+                    // filter_root とスキャン交差で実在するものだけが残る。
+                    let Some(cmd) = tool_command(item, backend) else { continue };
+                    for p in extract_refs(cmd) {
+                        data.refs.push(ReferRecord { path: p, at });
+                    }
+                }
             }
         }
     }
@@ -184,6 +210,7 @@ pub fn parse_log(path: &Path, backend: Backend) -> anyhow::Result<LogData> {
     // （sort_by_key は安定ソートなので同時刻は行順が保たれる）。
     data.reads.sort_by_key(|r| r.at);
     data.edits.sort_by_key(|r| r.at);
+    data.refs.sort_by_key(|r| r.at);
     fold_reads(&mut data.reads);
     Ok(data)
 }
@@ -194,11 +221,12 @@ fn record_time(rec: &Value) -> Option<SystemTime> {
     chrono::DateTime::parse_from_rfc3339(ts).ok().map(Into::into)
 }
 
-/// 対象 tool の種別（Read と Edit/Write の 2 系統のみ扱う）。
+/// 対象 tool の種別（Read / Edit/Write / Bash の 3 系統のみ扱う）。
 #[derive(Clone, Copy)]
 enum ToolKind {
     Read,
     Edit,
+    Bash,
 }
 
 /// content 要素が対象の tool 呼び出しなら種別を返す。未知の tool 名・
@@ -215,6 +243,7 @@ fn tool_kind(item: &Value, backend: Backend) -> Option<ToolKind> {
             match name {
                 "Read" => Some(ToolKind::Read),
                 "Edit" | "Write" => Some(ToolKind::Edit),
+                "Bash" => Some(ToolKind::Bash),
                 _ => None,
             }
         }
@@ -225,6 +254,7 @@ fn tool_kind(item: &Value, backend: Backend) -> Option<ToolKind> {
             match name {
                 "read" => Some(ToolKind::Read),
                 "edit" | "write" => Some(ToolKind::Edit),
+                "bash" => Some(ToolKind::Bash),
                 _ => None,
             }
         }
@@ -239,6 +269,54 @@ fn tool_path(item: &Value, backend: Backend) -> Option<&str> {
         Backend::Pi => "/arguments/path",
     };
     item.pointer(ptr).and_then(Value::as_str)
+}
+
+/// content 要素から bash の command 文字列を取り出す。
+/// Claude は `input.command`、pi は `arguments.command`。
+fn tool_command(item: &Value, backend: Backend) -> Option<&str> {
+    let ptr = match backend {
+        Backend::Claude => "/input/command",
+        Backend::Pi => "/arguments/command",
+    };
+    item.pointer(ptr).and_then(Value::as_str)
+}
+
+/// bash の command 文字列からパス候補を機械的に抽出する（同一コマンド内の
+/// 重複は除き、出現順）。
+///
+/// 「意味を解釈しない」方針: シェルの構文（パイプ・リダイレクト・変数展開・
+/// コマンドの意図）は理解せず、空白区切りのトークンから形だけで候補を拾う。
+/// 誤検出（リダイレクト先・cp のコピー先など）は許容する — それらも「コマンド
+/// が触ったファイル」であり、実在しない・root 外・無視リストのパスは後段の
+/// filter_root とスキャン交差が落とす。`ls` のような名前だけの言及もここでは
+/// 候補になるが、ディレクトリ・glob はスキャンと一致せず自然に消える。
+///
+/// 除外ルール（形だけで判定）:
+/// - `-` 始まり（オプション）
+/// - `$` を含む（変数展開）
+/// - `=` を含む（`FOO=bar cmd` 対策）
+/// - `*` を含む（glob）
+/// - 前後のクォート・末尾の `,;|&()` を剥いだ後、空になるもの
+/// - `.` も `/` も含まない（コマンド名・裸の単語・`cd` ターゲット等を形だけで
+///   排除。拡張子なしのファイル（LICENSE / Makefile 等）は落ちる代償がある）
+fn extract_refs(command: &str) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for tok in command.split_whitespace() {
+        if tok.starts_with('-') || tok.contains(['$', '=', '*']) {
+            continue;
+        }
+        let trimmed = tok.trim_matches(['\'', '"']);
+        let trimmed = trimmed.trim_end_matches([',', ';', '|', '&', '(', ')']);
+        if trimmed.is_empty() || (!trimmed.contains('.') && !trimmed.contains('/')) {
+            continue;
+        }
+        let p = PathBuf::from(trimmed);
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// 同一パスの連続 Read を、直前の採用 Read から FOLD_WINDOW 以内なら 1 回に畳む
@@ -281,6 +359,21 @@ pub fn filter_root(data: LogData, root: &Path) -> LogData {
             .edits
             .into_iter()
             .filter_map(|r| strip(&r.path).map(|path| EditRecord { path, at: r.at }))
+            .collect(),
+        refs: data
+            .refs
+            .into_iter()
+            .filter_map(|r| {
+                // bash 由来の参照は相対パス（`grep x README.md` 等）が主。
+                // 相対はそのまま通し、絶対は root 配下なら相対へ落とす。
+                // root 外の絶対パス（/tmp 等）は表示対象にならないので捨てる。
+                let path = if r.path.is_absolute() {
+                    r.path.strip_prefix(&root).ok()?.to_path_buf()
+                } else {
+                    r.path
+                };
+                Some(ReferRecord { path, at: r.at })
+            })
             .collect(),
     }
 }
@@ -557,5 +650,99 @@ mod tests {
         // base 自体が None（HOME 未設定相当）でもパニックしない
         let found = discover_at(Path::new("/Users/nagata/proj"), None, None);
         assert!(found.is_empty());
+    }
+
+    // --- bash 参照（機械抽出） ---
+
+    /// extract_refs の期待値ヘルパ。
+    fn refs(cmd: &str) -> Vec<PathBuf> {
+        extract_refs(cmd)
+    }
+
+    #[test]
+    fn extract_refs_picks_file_arguments_mechanically() {
+        // 単発のファイル引数（ユーザーの grep 例と同じ形）。コマンド名・
+        // 裸の単語（grep / TODO）は `.` `/` を含まないので形だけで落ちる
+        assert_eq!(refs("grep -n TODO README.md"), [PathBuf::from("README.md")]);
+        // パイプラインでも各ファイルは拾う
+        assert_eq!(
+            refs("cat src/main.rs | head -5"),
+            [PathBuf::from("src/main.rs")]
+        );
+        // 絶対パスもそのまま
+        assert_eq!(
+            refs("grep x /Users/nagata/proj/src/a.rs"),
+            [PathBuf::from("/Users/nagata/proj/src/a.rs")]
+        );
+        // 複数ファイル・同一コマンド内の重複は 1 回
+        assert_eq!(
+            refs("diff a.rs b.rs && cat a.rs"),
+            [PathBuf::from("a.rs"), PathBuf::from("b.rs")]
+        );
+    }
+
+    #[test]
+    fn extract_refs_skips_options_vars_glob_operators_and_bare_words() {
+        // オプション・代入・変数・glob・裸の単語は候補にしない
+        assert_eq!(refs("-n --oneline FOO=1 $HOME/x *.md grep TODO cd src"), Vec::<PathBuf>::new());
+        // 演算子だけのトークンは空になる
+        assert_eq!(refs("a.rs && b.rs | c.rs; d.rs"), [
+            PathBuf::from("a.rs"),
+            PathBuf::from("b.rs"),
+            PathBuf::from("c.rs"),
+            PathBuf::from("d.rs"),
+        ]);
+        // リダイレクト先も「触った」として許容（機械抽出の方針）
+        assert_eq!(
+            refs("cargo build > build.log 2>&1"),
+            [PathBuf::from("build.log")]
+        );
+        // クォートを剥ぐ（スペース入りファイル名は機械分割の限界で後半トークンのみ拾う）
+        assert_eq!(refs("grep \"a b\" 'file name.txt'"), [PathBuf::from("name.txt")]);
+    }
+
+    #[test]
+    fn bash_fixture_produces_refs_and_filter_root_keeps_relative() {
+        // claude fixture 末尾の bash（`grep -n TODO README.md && cat Cargo.toml | head -5`）
+        // → README.md / Cargo.toml の 2 件。相対パスは filter_root を通っても残る。
+        let data = parse_fixture(Backend::Claude, include_str!("testdata/claude-session.jsonl"));
+        let refs: Vec<(PathBuf, SystemTime)> =
+            data.refs.iter().map(|r| (r.path.clone(), r.at)).collect();
+        assert_eq!(
+            refs,
+            [
+                (PathBuf::from("README.md"), at("2026-08-11T01:07:00.000Z")),
+                (PathBuf::from("Cargo.toml"), at("2026-08-11T01:07:00.000Z")),
+            ]
+        );
+        let filtered = filter_root(data, Path::new("/Users/nagata/proj"));
+        let rels: Vec<PathBuf> = filtered.refs.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(rels, [PathBuf::from("README.md"), PathBuf::from("Cargo.toml")]);
+
+        // pi fixture 末尾の bash（`sed -n '1,5p' src/main.rs`）→ src/main.rs 1 件
+        let data = parse_fixture(Backend::Pi, include_str!("testdata/pi-session.jsonl"));
+        let refs: Vec<PathBuf> = data.refs.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(refs, [PathBuf::from("src/main.rs")]);
+    }
+
+    #[test]
+    fn filter_root_drops_absolute_refs_outside_root() {
+        // 絶対パスの参照は root 配下のみ相対化して残す（/tmp 等は捨てる）
+        let data = LogData {
+            refs: vec![
+                ReferRecord {
+                    path: PathBuf::from("/tmp/tui-out.txt"),
+                    at: at("2026-08-11T01:00:00.000Z"),
+                },
+                ReferRecord {
+                    path: PathBuf::from("/Users/nagata/proj/README.md"),
+                    at: at("2026-08-11T01:00:00.000Z"),
+                },
+            ],
+            ..Default::default()
+        };
+        let filtered = filter_root(data, Path::new("/Users/nagata/proj"));
+        let rels: Vec<PathBuf> = filtered.refs.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(rels, [PathBuf::from("README.md")]);
     }
 }
