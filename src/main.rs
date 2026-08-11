@@ -39,18 +39,20 @@ mod git;
 mod herdr;
 mod highlight;
 mod preview;
+mod readlog;
 mod theme;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use chrono::TimeZone;
 use ratatui::Frame;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{
@@ -63,7 +65,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Terminal;
 
 use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, is_fresh, to_local};
 use crate::highlight::Highlighter;
@@ -88,6 +89,14 @@ const MAX_EVENTS_PER_FRAME: usize = 64;
 const STATUS_SECS: Duration = Duration::from_secs(4);
 /// How often the listing silently refreshes for external changes.
 const REFRESH_TICK: Duration = Duration::from_secs(2);
+/// read ビューのログ監視周期（ログの (mtime, size) シグネチャを確認し、
+/// 伸びたログだけ再パースする）。mtime ビューでは監視しない。
+const READ_POLL_TICK: Duration = Duration::from_millis(500);
+/// read ビューで「新規に現れたファイル」を fresh アクセントで表示する
+/// ウィンドウ。既存の 1 時間以内ハイライトと同じ見た目（時刻のイタリック）
+/// だが、ログが伸び続けると全行がハイライトされてしまうため、到着からの
+/// 時間で短めに切る。
+const READ_FRESH_WINDOW: Duration = Duration::from_secs(60);
 /// Command-line configuration (spec: 起動 → フラグ).
 struct Config {
     /// Explicit directory argument (spec priority 1); `None` = herdr → cwd.
@@ -130,6 +139,9 @@ struct Config {
     /// `None` (the default) = auto-detect the terminal background via
     /// OSC 11, falling back to dark when the terminal doesn't answer.
     light: Option<bool>,
+    /// 起動時ビュー（`--view mtime|read`; デフォルト mtime。`r` キーで
+    /// トグル）。read ビューはエージェントが read したファイルを表示する。
+    view: View,
 }
 
 /// What the process should do, resolved from argv.
@@ -165,6 +177,27 @@ impl PreviewMode {
 
 /// `auto` hides the preview below this terminal width.
 const PREVIEW_MIN_WIDTH: u16 = 80;
+
+/// 表示ビュー（`r` キーと `--view` で切替）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    /// 従来の mtime ビュー（ファイルの mtime 順・日付クラスタ）。
+    Mtime,
+    /// read ビュー（エージェントが read したファイルを read 時刻順に表示。
+    /// ログの伸びを 500ms 周期で監視してライブ更新する）。
+    Read,
+}
+
+impl View {
+    /// Parse `--view <mtime|read>`; `None` for unknown values.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mtime" => Some(View::Mtime),
+            "read" => Some(View::Read),
+            _ => None,
+        }
+    }
+}
 
 /// `--files` output format.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -264,7 +297,8 @@ fn midnight_cutoff(
 /// The next argument as `flag`'s value; an error when the flag is last
 /// (a flag missing its value must not be silently ignored).
 fn flag_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<String> {
-    it.next().with_context(|| format!("{flag} requires a value"))
+    it.next()
+        .with_context(|| format!("{flag} requires a value"))
 }
 
 impl Config {
@@ -283,6 +317,7 @@ impl Config {
         let mut output = false;
         let mut theme: Option<String> = None;
         let mut light: Option<bool> = None;
+        let mut view = View::Mtime;
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -324,9 +359,16 @@ impl Config {
                     let v = flag_value(&mut it, "--since")?;
                     since = match Since::parse(&v) {
                         Some(s) => Some(s),
-                        None => bail!(
-                            "invalid --since value: {v} (expected today|yesterday|Nd|Nw)"
-                        ),
+                        None => {
+                            bail!("invalid --since value: {v} (expected today|yesterday|Nd|Nw)")
+                        }
+                    };
+                }
+                "--view" => {
+                    let v = flag_value(&mut it, "--view")?;
+                    view = match View::parse(&v) {
+                        Some(v) => v,
+                        None => bail!("invalid --view value: {v} (expected mtime|read)"),
                     };
                 }
                 other if !other.starts_with('-') && dir.is_none() => {
@@ -358,6 +400,7 @@ impl Config {
             output,
             theme,
             light,
+            view,
         }))
     }
 
@@ -410,6 +453,8 @@ fn main() -> Result<()> {
                  \x20 --files         no TUI: print the time-sorted listing\n\
                  \x20 --format <path|tsv>  --files output (tsv = time column)\n\
                  \x20 --since <today|yesterday|Nd|Nw>  --files cutoff\n\
+                 \x20 --view <mtime|read> initial view (default mtime; read = the\n\
+                 \x20                   agent-read files by read time, live-updated)\n\
                  \x20 --output       explicit output mode (same as the default;\n\
                  \x20                   exclusive with --open-cmd)\n\
                  \n\
@@ -422,10 +467,12 @@ fn main() -> Result<()> {
                  \x20 /              incremental filter (Enter apply, Esc clear)\n\
                  \x20 \\              toggle the filter off/on (text is kept)\n\
                  \x20 t              sort cycle: mtime↓ mtime↑ ctime↓ ctime↑\n\
+                 \x20 r              toggle mtime view / read view (agent-read\n\
+                 \x20                   files by read time, live-updated)\n\
                  \x20 Ctrl+h/Backspace  toggle hidden dirs   d  toggle directories\n\
                  \x20 q              quit   Esc  clear selection
                  \x20 u              toggle: only files with uncommitted changes
-                 \x20                   (in a git repo; dirty rows show +N -M)"
+                 \x20                   (in a git repo; dirty rows show +N -M)",
             )?;
             Ok(())
         }
@@ -528,6 +575,25 @@ struct App {
     git: Option<git::GitCache>,
     /// `u` key: show only files with uncommitted changes (spec 4-2).
     uncommitted_only: bool,
+    /// 現在のビュー（`r` キー / `--view` で切替）。
+    view: View,
+    /// read ビューの行（read 時刻降順。`Row::File(i)` はこの index）。
+    read_rows: Vec<files::ReadRow>,
+    /// マージ済み read ログ（`filter_root` 済み・相対パス）。
+    read_log: readlog::LogData,
+    /// ログファイルごとのパース済みデータ（再パース不要のログはここから）。
+    read_cache: HashMap<PathBuf, readlog::LogData>,
+    /// ログファイルの (mtime, size) シグネチャ（git 連携と同じ変更ゲート。
+    /// 伸びたログだけ再パースする）。
+    read_sig: HashMap<PathBuf, Option<(SystemTime, u64)>>,
+    /// パス → 初めて read ビューに現れた時刻（fresh アクセント判定。
+    /// away 復帰時は再シードして「到着した新規 read」を目立たせる）。
+    read_first_seen: HashMap<PathBuf, Instant>,
+    /// フォーカス喪失中に到着した新規 read のパス（復帰時に fresh へ
+    /// 再シードする。既存 away-diff の read ビュー版・簡易実装）。
+    away_reads: Vec<PathBuf>,
+    /// ログ監視の前回実行時刻（[`READ_POLL_TICK`] 周期）。
+    last_log_poll: Instant,
     running: bool,
 }
 
@@ -535,8 +601,22 @@ impl App {
     /// The `files` index under the cursor, if any.
     fn cursor_file_idx(&self) -> Option<usize> {
         match self.visible.get(self.cursor) {
-            Some(Row::File(i)) => Some(*i),
+            Some(Row::File(i)) => match self.view {
+                // mtime ビュー: `files` の index がそのまま行 index。
+                View::Mtime => Some(*i),
+                // read ビュー: 行 → `read_rows` → スキャンエントリの index。
+                View::Read => self.read_rows.get(*i).map(|r| r.idx),
+            },
             _ => None,
+        }
+    }
+
+    /// 表示行 `Row::File(i)` が指すスキャンエントリ（ビューで解決先が
+    /// 変わる: mtime ビューは `files`、read ビューは `read_rows` 経由）。
+    fn row_file(&self, i: usize) -> Option<&FileEntry> {
+        match self.view {
+            View::Mtime => self.files.get(i),
+            View::Read => self.read_rows.get(i).and_then(|r| self.files.get(r.idx)),
         }
     }
 
@@ -596,6 +676,8 @@ impl App {
     fn focus_lost(&mut self) {
         self.focused = false;
         self.away_changes.clear();
+        // read ビュー版: away 中に到着した新規 read もここから数える。
+        self.away_reads.clear();
     }
 
     /// Focus regained: drop the away stack and revert instantly to the
@@ -604,16 +686,41 @@ impl App {
     fn focus_gained(&mut self) {
         self.focused = true;
         self.away_changes.clear();
+        // read ビュー: away 中に到着した新規 read を fresh ウィンドウへ
+        // 再シード — 復帰時に同様にハイライトされる（既存 away 機構の
+        // 流用ではなく、専用の簡易実装: away パス集合を保持）。
+        for p in self.away_reads.drain(..) {
+            self.read_first_seen.insert(p, Instant::now());
+        }
     }
 
     /// Rebuild `visible` from `files` (filter + clusters), then place the
     /// cursor on `cursor_path` if it is still listed, else on the first
     /// file. `cursor_path` = `None` keeps the current cursor file.
+    /// read ビュー表示中は行源が `read_rows` に変わるだけで、カーソルの
+    /// パス保存・フィルタの扱いは両ビュー共通。
     fn rebuild_visible(&mut self, cursor_path: Option<&Path>) {
         let want = match cursor_path {
             Some(p) => Some(p.to_path_buf()),
             None => self.cursor_file().map(|e| e.path.clone()),
         };
+        match self.view {
+            View::Mtime => self.rebuild_mtime_visible(),
+            View::Read => self.rebuild_read_visible(),
+        }
+        // Cursor: prefer the preserved file, else the first file row.
+        self.cursor = want
+            .and_then(|p| {
+                self.visible.iter().position(
+                    |r| matches!(r, Row::File(i) if self.row_file(*i).is_some_and(|e| e.path == p)),
+                )
+            })
+            .unwrap_or_else(|| first_file_row(&self.visible));
+    }
+
+    /// mtime ビューの行組み立て（従来どおりの挙動。read ビュー off 時は
+    /// 完全にこの経路だけが走る）。
+    fn rebuild_mtime_visible(&mut self) {
         let now = chrono::Local::now();
         let cutoff = self.since.map(|s| s.cutoff(now));
         let needle = files::prepare_filter(&self.filter);
@@ -640,14 +747,62 @@ impl App {
             visible.push(Row::File(i));
         }
         self.visible = visible;
-        // Cursor: prefer the preserved file, else the first file row.
-        self.cursor = want
-            .and_then(|p| {
-                self.visible
-                    .iter()
-                    .position(|r| matches!(r, Row::File(i) if self.files[*i].path == p))
-            })
-            .unwrap_or_else(|| first_file_row(&self.visible));
+    }
+
+    /// read ビューの行組み立て: マージ済みログ + 現在のスキャンから行を
+    /// 作り、`/`・`u` フィルタを適用して read 時刻基準のクラスタ区切りを
+    /// 入れる（並びは build_read_rows が read 時刻降順に整列済み）。
+    /// 前回の行セットに無かったパスは「新規出現」として fresh シードし、
+    /// フォーカス喪失中なら [`App::away_reads`] にも積む（復帰時ハイライト
+    /// のため）。
+    fn rebuild_read_visible(&mut self) {
+        let now = chrono::Local::now();
+        let rows = files::build_read_rows(&self.read_log, &self.files, now);
+        // fresh シード: 前回の行セットに無かったパスだけ。ログ到着と
+        // スキャン遅延（新規ファイルが 2 秒リセキャンで拾われる）の
+        // どちらもここで拾える。
+        let known: HashSet<&Path> = self
+            .read_rows
+            .iter()
+            .map(|r| self.files[r.idx].rel.as_path())
+            .collect();
+        for r in &rows {
+            let rel = &self.files[r.idx].rel;
+            if known.contains(rel.as_path()) {
+                continue;
+            }
+            if !self.focused && !self.away_reads.contains(rel) {
+                self.away_reads.push(rel.clone());
+            }
+            self.read_first_seen
+                .entry(rel.clone())
+                .or_insert_with(Instant::now);
+        }
+        // ウィンドウ外のシードはもう不要（fresh 判定は 60 秒で切れる）。
+        self.read_first_seen
+            .retain(|_, t| t.elapsed() < READ_FRESH_WINDOW);
+        self.read_rows = rows;
+        let needle = files::prepare_filter(&self.filter);
+        let mut visible: Vec<Row> = Vec::new();
+        let mut last_cluster: Option<Cluster> = None;
+        for (i, r) in self.read_rows.iter().enumerate() {
+            let e = &self.files[r.idx];
+            // `/` フィルタは相対パスに対して既存どおり効く。
+            if self.filter_on && !files::matches_prepared(e, &needle) {
+                continue;
+            }
+            // `u` フィルタも同じ軸で効く（git マーカーは read 行にも
+            // 表示するので、絞り込みも揃える）。
+            if self.uncommitted_only && !self.is_uncommitted(e) {
+                continue;
+            }
+            if last_cluster != Some(r.cluster) {
+                last_cluster = Some(r.cluster);
+                visible.push(Row::Separator(r.cluster));
+            }
+            visible.push(Row::File(i));
+        }
+        self.visible = visible;
     }
 
     /// Whether a file has uncommitted changes (git active only).
@@ -733,6 +888,37 @@ impl App {
         }
     }
 
+    /// read ビューのログ監視（表示中のみ。event_loop が [`READ_POLL_TICK`]
+    /// 周期で呼ぶ）。discover されたログの (mtime, size) シグネチャが
+    /// 変わったものだけ再パースし、マージ結果が変わったら行を組み直す。
+    /// 書きかけログ等の一時エラーは静かに前回のキャッシュを維持する
+    /// （数百 ms 後の次回ポーリングで追いつく）。
+    fn poll_read_logs(&mut self) {
+        let logs = readlog::discover(&self.root);
+        let mut sigs: HashMap<PathBuf, Option<(SystemTime, u64)>> = HashMap::new();
+        for (backend, path) in &logs {
+            let sig = log_signature(path);
+            sigs.insert(path.clone(), sig);
+            if sig == self.read_sig.get(path).copied().flatten() {
+                continue; // 伸びていないログは再パースしない
+            }
+            if let Ok(data) = readlog::parse_log(path, *backend) {
+                let data = readlog::filter_root(data, &self.root);
+                self.read_cache.insert(path.clone(), data);
+            }
+        }
+        // discover から消えたログ（ローテーション等）のキャッシュは落とす。
+        self.read_cache.retain(|p, _| sigs.contains_key(p));
+        self.read_sig = sigs;
+        let merged = collect_read_logs(&self.read_cache);
+        // LogData は契約上 PartialEq を持たないのでフィールド比較する。
+        if merged.reads == self.read_log.reads && merged.edits == self.read_log.edits {
+            return; // 何も変わっていない: 行もビューも触らない
+        }
+        self.read_log = merged;
+        self.rebuild_visible(None);
+    }
+
     /// Adopt a fresh scan (already in the current sort order): remap the
     /// selection and cursor by path, rebuild the visible list, and drop
     /// the preview cache.
@@ -800,10 +986,7 @@ impl App {
             // Input burst in progress: defer the render (speed first).
             return vec![
                 header,
-                Line::from(Span::styled(
-                    "…",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(Span::styled("…", Style::default().fg(Color::DarkGray))),
             ];
         }
         let p = preview::render(&e.path, e.size, e.is_dir, width, height, &self.highlight);
@@ -934,6 +1117,11 @@ fn print_line(line: &str) -> Result<()> {
 /// plain lines for `ashiato --files | fzf` and friends.
 fn run_files(config: &Config) -> Result<()> {
     let root = resolve_root(config.dir.as_deref())?;
+    // `--view read`: TUI を開かず、read されたファイルを read 時刻降順で
+    // stdout に出力する（--format path|tsv。tsv の時刻は read 時刻）。
+    if config.view == View::Read {
+        return run_files_read(config, &root);
+    }
     let mut entries = files::scan(&root, config.show_hidden, config.show_dirs)?;
     files::sort_entries(&mut entries, config.sort);
     let now = chrono::Local::now();
@@ -942,6 +1130,76 @@ fn run_files(config: &Config) -> Result<()> {
             OutputFormat::Path => e.path.display().to_string(),
             OutputFormat::Tsv => {
                 let t = to_local(e.mtime);
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| e.path.display().to_string());
+                format!(
+                    "{}\t{name}\t{}",
+                    t.format("%Y-%m-%d %H:%M:%S"),
+                    e.path.display()
+                )
+            }
+        };
+        print_line(&line)?;
+    }
+    Ok(())
+}
+
+/// ログファイルの (mtime, size) シグネチャ（git 連携と同じ変更ゲート）。
+/// 存在しないファイルは `None` — 消えたログは再パース対象になる。
+fn log_signature(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len()))
+}
+
+/// 複数ログのパース結果（`filter_root` 済み）をマージして時系列順に
+/// 整列する（純ロジック。TUI のポーリングと `--files --view read` で
+/// 共用）。ログをまたぐ Read の畳み込みはしない — 別セッションの別 read
+/// は別の read として数える（畳み込みは readlog::parse_log 内の契約）。
+fn collect_read_logs(cache: &HashMap<PathBuf, readlog::LogData>) -> readlog::LogData {
+    let mut merged = readlog::LogData::default();
+    for data in cache.values() {
+        merged.reads.extend(data.reads.iter().cloned());
+        merged.edits.extend(data.edits.iter().cloned());
+    }
+    merged
+        .reads
+        .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.path.cmp(&b.path)));
+    merged
+        .edits
+        .sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.path.cmp(&b.path)));
+    merged
+}
+
+/// `--files --view read` 本体: discover → parse → filter_root → マージ →
+/// スキャン存在フィルタ → `--filter` → read 時刻降順で出力。TUI の
+/// read ビューと同じ行構築（build_read_rows）を共有する。
+fn run_files_read(config: &Config, root: &Path) -> Result<()> {
+    let entries = files::scan(root, config.show_hidden, config.show_dirs)?;
+    let cache: HashMap<PathBuf, readlog::LogData> = readlog::discover(root)
+        .into_iter()
+        .filter_map(|(backend, path)| {
+            let data = readlog::parse_log(&path, backend).ok()?;
+            Some((path, readlog::filter_root(data, root)))
+        })
+        .collect();
+    let log = collect_read_logs(&cache);
+    let now = chrono::Local::now();
+    let rows = files::build_read_rows(&log, &entries, now);
+    let needle = files::prepare_filter(&config.filter);
+    for r in rows {
+        let e = &entries[r.idx];
+        // `/` フィルタと同じく相対パス基準（--since は mtime ベースなので
+        // read ビューでは適用しない）。
+        if !files::matches_prepared(e, &needle) {
+            continue;
+        }
+        let line = match config.format {
+            OutputFormat::Path => e.path.display().to_string(),
+            OutputFormat::Tsv => {
+                let t = to_local(r.last_read);
                 let name = e
                     .path
                     .file_name()
@@ -971,8 +1229,7 @@ fn filter_entries(
     entries
         .into_iter()
         .filter(|e| {
-            files::matches_prepared(e, &needle)
-                && since.is_none_or(|s| e.mtime >= s.cutoff(now))
+            files::matches_prepared(e, &needle) && since.is_none_or(|s| e.mtime >= s.cutoff(now))
         })
         .collect()
 }
@@ -1067,7 +1324,11 @@ fn ensure_terminal_stdin() {
     }
     // Other platforms (and macOS without a matching pty): the controlling
     // terminal node itself — epoll etc. accept it, so crossterm works.
-    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    if let Ok(tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
         use std::os::fd::AsRawFd;
         // SAFETY: both fds are valid; dup2 replaces fd 0 with the tty.
         unsafe {
@@ -1084,7 +1345,9 @@ fn rebind_to_controlling_pty() -> bool {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     let me = unsafe { libc::getpgrp() };
-    let Ok(rd) = std::fs::read_dir("/dev") else { return false };
+    let Ok(rd) = std::fs::read_dir("/dev") else {
+        return false;
+    };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with("ttys") {
@@ -1151,7 +1414,9 @@ impl Drop for TermGuard {
         // The signal handler must not restore after we have (a signal
         // landing mid-restore would double-leave the alternate screen).
         TUI_ACTIVE.store(false, Ordering::SeqCst);
-        if self.alt && let Some(t) = &mut self.term {
+        if self.alt
+            && let Some(t) = &mut self.term
+        {
             let _ = execute!(
                 t.backend_mut(),
                 Show,
@@ -1235,7 +1500,10 @@ fn install_signal_handlers() {
         // SAFETY: `restore_terminal_and_die` is a valid handler, and
         // the default disposition is restored before it re-raises.
         libc::signal(libc::SIGINT, restore_terminal_and_die as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, restore_terminal_and_die as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            restore_terminal_and_die as libc::sighandler_t,
+        );
     }
 }
 
@@ -1309,6 +1577,14 @@ fn run(config: Config) -> Result<()> {
         away_changes: Vec::new(),
         git: None,
         uncommitted_only: false,
+        view: View::Mtime,
+        read_rows: Vec::new(),
+        read_log: readlog::LogData::default(),
+        read_cache: HashMap::new(),
+        read_sig: HashMap::new(),
+        read_first_seen: HashMap::new(),
+        away_reads: Vec::new(),
+        last_log_poll: Instant::now(),
         running: true,
     };
     // The config flags seed the sort/toggles; the `t`/Ctrl+h/`d` keys
@@ -1316,6 +1592,7 @@ fn run(config: Config) -> Result<()> {
     app.sort = app.config.sort;
     app.show_hidden = app.config.show_hidden;
     app.show_dirs = app.config.show_dirs;
+    app.view = app.config.view;
     let terminal = make_terminal()?; // the guard restores raw mode on error
     guard.term = Some(terminal);
     let _ = enter_tui_modes(guard.backend_mut());
@@ -1346,6 +1623,11 @@ fn run(config: Config) -> Result<()> {
         // The scan is done and the listing is live: drop the placeholder.
         app.status = None;
     }
+    // `--view read` 起動: 最初のログ読み込み（以後は event_loop が
+    // READ_POLL_TICK 周期で追いかける）。
+    if app.view == View::Read {
+        app.poll_read_logs();
+    }
     let res = event_loop(&mut guard, &mut app);
     // The guard's Drop restores the terminal (alternate screen + raw
     // mode) before the output prints below.
@@ -1368,7 +1650,10 @@ fn run(config: Config) -> Result<()> {
 /// blocking (the pty master may stay open — herdr keeps it for
 /// scrollback). Polled every tick as a death watchdog.
 fn controlling_terminal_alive() -> bool {
-    std::fs::OpenOptions::new().read(true).open("/dev/tty").is_ok()
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/tty")
+        .is_ok()
 }
 
 /// Whether stdin's writer is gone (POLLHUP): a pipe-based virtual
@@ -1393,9 +1678,7 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
     let watch_terminal = controlling_terminal_alive();
     let watch_stdin = !watch_terminal;
     loop {
-        if (watch_terminal && !controlling_terminal_alive())
-            || (watch_stdin && stdin_hung_up())
-        {
+        if (watch_terminal && !controlling_terminal_alive()) || (watch_stdin && stdin_hung_up()) {
             return Err(anyhow::anyhow!("terminal gone; exiting"));
         }
         // Burst-aware poll: while the user is mashing j/k the preview is
@@ -1450,6 +1733,13 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
             app.last_refresh = Instant::now();
             app.refresh_if_changed();
         }
+        // read ビュー表示中だけログを 500ms 周期で監視する（伸びたログの
+        // 再パースは poll_read_logs のシグネチャゲートが拾う。mtime ビュー
+        // では従来どおり何もしない）。
+        if app.view == View::Read && app.last_log_poll.elapsed() >= READ_POLL_TICK {
+            app.last_log_poll = Instant::now();
+            app.poll_read_logs();
+        }
         if app
             .status
             .as_ref()
@@ -1463,12 +1753,7 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
     }
 }
 
-fn on_key(
-    app: &mut App,
-    key: KeyCode,
-    modifiers: KeyModifiers,
-    terminal: Option<&mut TermGuard>,
-) {
+fn on_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers, terminal: Option<&mut TermGuard>) {
     if app.filter_active {
         return on_filter_key(app, key, modifiers, terminal);
     }
@@ -1514,11 +1799,34 @@ fn on_key(
         KeyCode::Char('o') => open_selection_alt(app, terminal),
         KeyCode::Char('y') => copy_paths(app),
         KeyCode::Char('/') => app.filter_active = true,
+        KeyCode::Char('r') => {
+            // ビュー切替: mtime ↔ read。カーソルは切替前にいたファイルを
+            // 新しいビューでも辿る（visible の行源が変わる前に want を取る
+            // — 切替後に取ると古い行 index を別ビューで解釈してしまう）。
+            let want = app.cursor_file().map(|e| e.path.clone());
+            app.view = if app.view == View::Mtime {
+                View::Read
+            } else {
+                View::Mtime
+            };
+            if app.view == View::Read {
+                // トグル直後も 500ms 待たせずログを即時読み込む（データが
+                // 変わっていれば poll 側でも行を組み直す）。
+                app.poll_read_logs();
+            }
+            app.rebuild_visible(want.as_deref());
+        }
         KeyCode::Char('t') => {
-            app.sort = app.sort.next();
-            app.resort_files();
-            app.preview_cache = None;
-            app.rebuild_visible(None);
+            if app.view == View::Read {
+                // read ビューは read 時刻降順で固定（`t` は mtime ビューの
+                // ソート用。ソート状態は mtime ビューに戻るまで保持）。
+                app.flash("read view: 並びは read 時刻順で固定");
+            } else {
+                app.sort = app.sort.next();
+                app.resort_files();
+                app.preview_cache = None;
+                app.rebuild_visible(None);
+            }
         }
         KeyCode::Char('h') if modifiers.contains(KeyModifiers::CONTROL) => toggle_hidden(app),
         KeyCode::Char('d') => {
@@ -1592,8 +1900,11 @@ fn mark_input(app: &mut App) {
 /// 超えていることがあるため、飽和減算でパニックを避け下限 5ms に丸める。
 fn poll_timeout(bursting: bool, quiet: Duration) -> Duration {
     if bursting {
-        Duration::from_millis(TICK_MS)
-            .min(BURST_GAP.saturating_sub(quiet).max(Duration::from_millis(5)))
+        Duration::from_millis(TICK_MS).min(
+            BURST_GAP
+                .saturating_sub(quiet)
+                .max(Duration::from_millis(5)),
+        )
     } else {
         Duration::from_millis(TICK_MS)
     }
@@ -1681,7 +1992,10 @@ fn open_selection(app: &mut App, terminal: Option<&mut TermGuard>) {
         app.running = false;
         return;
     }
-    let cmd = expand_cmd(app.config.open_cmd.as_deref().expect("checked above"), &paths);
+    let cmd = expand_cmd(
+        app.config.open_cmd.as_deref().expect("checked above"),
+        &paths,
+    );
     open_with_cmd(app, terminal, &cmd);
 }
 
@@ -1712,7 +2026,12 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
         // disarm the guard — the child owns the terminal now, so a
         // panic or signal mid-child must not restore it out from under
         // the child.
-        let _ = execute!(g.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
+        let _ = execute!(
+            g.backend_mut(),
+            LeaveAlternateScreen,
+            Show,
+            DisableMouseCapture
+        );
         g.alt = false;
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
         g.raw_off();
@@ -1731,9 +2050,7 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
     let watch_terminal = controlling_terminal_alive();
     let watch_stdin = !watch_terminal;
     let status = loop {
-        if (watch_terminal && !controlling_terminal_alive())
-            || (watch_stdin && stdin_hung_up())
-        {
+        if (watch_terminal && !controlling_terminal_alive()) || (watch_stdin && stdin_hung_up()) {
             let _ = child.kill();
             let _ = child.wait();
             app.flash_err("terminal gone — child killed");
@@ -1784,7 +2101,8 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
         Ok(s) if s.success() => app.flash("done — list rescanned"),
         Ok(s) => app.flash_err(format!(
             "command exited with {}",
-            s.code().map_or_else(|| "signal".to_string(), |c| c.to_string())
+            s.code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string())
         )),
         Err(e) => app.flash_err(format!("spawn failed: {e}")),
     }
@@ -2018,7 +2336,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     let mut list_lines: Vec<Line> = Vec::with_capacity(list_h);
     let list_width = list_area.width.saturating_sub(1) as usize;
     if app.visible.is_empty() {
-        let msg = if app.uncommitted_only && (app.filter.is_empty() || !app.filter_on) {
+        let msg = if app.view == View::Read {
+            if app.filter.is_empty() || !app.filter_on {
+                "no reads"
+            } else {
+                "no match"
+            }
+        } else if app.uncommitted_only && (app.filter.is_empty() || !app.filter_on) {
             "no uncommitted changes"
         } else if app.filter.is_empty() || !app.filter_on {
             "no files"
@@ -2034,18 +2358,23 @@ fn draw(f: &mut Frame, app: &mut App) {
         match &app.visible[i] {
             Row::Separator(c) => {
                 list_lines.push(separator_line(&c.label(now), list_width, app.ui_border))
-            },
-            Row::File(idx) => {
-                let in_away = away.contains(app.files[*idx].path.as_path());
-                list_lines.push(file_line(
-                    app,
-                    *idx,
-                    list_width,
-                    i == app.cursor,
-                    now,
-                    in_away,
-                ));
             }
+            Row::File(idx) => match app.view {
+                View::Mtime => {
+                    let in_away = away.contains(app.files[*idx].path.as_path());
+                    list_lines.push(file_line(
+                        app,
+                        *idx,
+                        list_width,
+                        i == app.cursor,
+                        now,
+                        in_away,
+                    ));
+                }
+                View::Read => {
+                    list_lines.push(read_line(app, *idx, list_width, i == app.cursor, now));
+                }
+            },
         }
     }
     f.render_widget(Paragraph::new(list_lines), list_area);
@@ -2078,6 +2407,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         Style::default().fg(Color::White),
     ));
     footer1.push(Span::raw(" "));
+    if app.view == View::Read {
+        // 現在ビューのバッジ（既存のソート表示は維持したまま、その直後に）。
+        footer1.push(Span::styled("[read]", Style::default().fg(Color::White)));
+        footer1.push(Span::raw(" "));
+    }
     footer1.push(toggle_span("hidden", app.show_hidden));
     footer1.push(Span::raw(" "));
     footer1.push(toggle_span("dirs", app.show_dirs));
@@ -2116,7 +2450,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     let mut footer2 = vec![
         hint("Space", "select"),
-        hint("Enter", if app.config.open_cmd.is_some() { "open" } else { "output" }),
+        hint(
+            "Enter",
+            if app.config.open_cmd.is_some() {
+                "open"
+            } else {
+                "output"
+            },
+        ),
         hint("y", "copy"),
         hint("/", "filter"),
         hint("\\", "toggle"),
@@ -2130,6 +2471,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     if app.git.is_some() {
         footer2.push(hint("u", "uncommitted"));
+    }
+    if app.view == View::Read {
+        // read ビューから戻るキーは read ビュー表示中だけ案内する
+        // （mtime ビューのフッターは従来どおりのまま）。
+        footer2.push(hint("r", "mtime"));
     }
     if let Some((msg, _, err)) = &app.status {
         footer1.push(Span::raw("  "));
@@ -2265,8 +2611,10 @@ fn file_line(
         .as_ref()
         .and_then(|g| g.marker_for(&e.path))
         .map(git::GitStatus::marker);
-    let git_marker_w =
-        git_marker.as_ref().map(|m| files::display_width(m)).unwrap_or(0);
+    let git_marker_w = git_marker
+        .as_ref()
+        .map(|m| files::display_width(m))
+        .unwrap_or(0);
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
     let left_w = files::display_width(&dir) + files::display_width(&name);
@@ -2323,7 +2671,116 @@ fn file_line(
         Span::styled(name, name_style),
     ];
     if !right_spans.is_empty() {
-        spans.push(Span::styled(" ".repeat(avail.saturating_sub(left_w + right_w)), base));
+        spans.push(Span::styled(
+            " ".repeat(avail.saturating_sub(left_w + right_w)),
+            base,
+        ));
+        spans.extend(right_spans);
+    }
+    Line::from(spans)
+}
+
+/// read ビューの 1 行: 既存のファイル行と同じレイアウト（マーカー + dir +
+/// 名前）で、右側は read バッジ — `×N`（畳み込み後 read 回数）+ `●`
+/// （read 後に Edit/Write されたファイル）+ git マーカー + 最後に read
+/// された時刻（format_time 再利用）。
+///
+/// 新規に現れたファイル（fresh）は既存の 1 時間以内ハイライトと同じ見た目
+/// （時刻のイタリック）で表示し、バッジも同じアクセントにする。既知
+/// ファイルの再 read は行が上に浮くだけ（並びは build_read_rows が
+/// read 時刻降順に保つ）。
+///
+/// 幅が足りないときの犠牲順は: read 時刻 → git マーカー（バッジ ×N / ●
+/// は read ビューの主役なので常に残す）。
+fn read_line(
+    app: &App,
+    row_idx: usize,
+    width: usize,
+    is_cursor: bool,
+    now: chrono::DateTime<chrono::Local>,
+) -> Line<'static> {
+    let row = &app.read_rows[row_idx];
+    let e = &app.files[row.idx];
+    let sel = app.selected.contains(&row.idx);
+    let base = if is_cursor || sel {
+        Style::default().bg(app.ui_selected_bg)
+    } else {
+        Style::default()
+    };
+    let marker = if is_cursor {
+        "> "
+    } else if sel {
+        "* "
+    } else {
+        "  "
+    };
+    let name_style = if is_cursor {
+        base.fg(Color::Cyan)
+    } else {
+        base
+    };
+    let rel = e.display_rel();
+    let (dir, name) = match rel.rfind('/') {
+        Some(i) => (&rel[..i + 1], &rel[i + 1..]),
+        None => ("", rel.as_str()),
+    };
+    let name = if e.is_dir {
+        format!("{name}/")
+    } else {
+        name.to_string()
+    };
+    let avail = width.saturating_sub(files::display_width(marker));
+    let (dir, name) = fit_path(dir, &name, avail);
+    let left_w = files::display_width(&dir) + files::display_width(&name);
+    let room = avail.saturating_sub(left_w).saturating_sub(2);
+    // fresh = 新規に現れたファイル（到着から READ_FRESH_WINDOW 以内）。
+    // 既存の 1 時間以内ハイライトと同じ見た目 = イタリック。
+    let fresh = app
+        .read_first_seen
+        .get(&e.rel)
+        .is_some_and(|t| t.elapsed() < READ_FRESH_WINDOW);
+    let badge_style = {
+        let mut s = base.add_modifier(Modifier::DIM);
+        if fresh {
+            s = s.add_modifier(Modifier::ITALIC);
+        }
+        s
+    };
+    let mut time_style = base.add_modifier(Modifier::DIM);
+    if fresh {
+        time_style = time_style.add_modifier(Modifier::ITALIC);
+    }
+    // 右側要素を優先順（×N → ● → git → 時刻）に詰める。
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
+    let mut right_w = 0usize;
+    let mut push_right = |s: String, st: Style| {
+        let w = files::display_width(&s) + usize::from(!right_spans.is_empty());
+        if right_w + w <= room {
+            if !right_spans.is_empty() {
+                right_spans.push(Span::raw(" "));
+            }
+            right_w += w;
+            right_spans.push(Span::styled(s, st));
+        }
+    };
+    push_right(format!("×{}", row.read_count), badge_style);
+    if row.edited {
+        push_right("●".to_string(), badge_style);
+    }
+    if let Some(gm) = app.git.as_ref().and_then(|g| g.marker_for(&e.path)) {
+        push_right(gm.marker(), badge_style);
+    }
+    push_right(format_time(now, to_local(row.last_read)), time_style);
+    let mut spans = vec![
+        Span::styled(marker, name_style),
+        Span::styled(dir, base.fg(app.ui_border)),
+        Span::styled(name, name_style),
+    ];
+    if !right_spans.is_empty() {
+        spans.push(Span::styled(
+            " ".repeat(avail.saturating_sub(left_w + right_w)),
+            base,
+        ));
         spans.extend(right_spans);
     }
     Line::from(spans)
@@ -2428,7 +2885,10 @@ mod tests {
             Duration::from_millis(TICK_MS).min(BURST_GAP - Duration::from_millis(10))
         );
         // 非バースト時は通常の tick。
-        assert_eq!(poll_timeout(false, Duration::ZERO), Duration::from_millis(TICK_MS));
+        assert_eq!(
+            poll_timeout(false, Duration::ZERO),
+            Duration::from_millis(TICK_MS)
+        );
     }
 
     #[test]
@@ -2443,12 +2903,12 @@ mod tests {
             "vim -p '/a/one.md' '/b/two.md'"
         );
         // No indexed placeholder and no `{}` → paths appended.
-        assert_eq!(
-            expand_cmd("x {3}", &paths),
-            "x {3} '/a/one.md' '/b/two.md'"
-        );
+        assert_eq!(expand_cmd("x {3}", &paths), "x {3} '/a/one.md' '/b/two.md'");
         // No placeholder → paths appended.
-        assert_eq!(expand_cmd("akapen", &paths), "akapen '/a/one.md' '/b/two.md'");
+        assert_eq!(
+            expand_cmd("akapen", &paths),
+            "akapen '/a/one.md' '/b/two.md'"
+        );
         // Non-numeric braces stay literal (and don't count as substituted).
         assert_eq!(
             expand_cmd("awk '{print}'", &paths),
@@ -2501,15 +2961,23 @@ mod tests {
 
     #[test]
     fn config_output_is_exclusive_with_open_cmd() {
-        assert!(Config::parse(
-            ["--output".to_string(), "--open-cmd".to_string(), "x".to_string()]
-        )
-        .is_err());
+        assert!(
+            Config::parse([
+                "--output".to_string(),
+                "--open-cmd".to_string(),
+                "x".to_string()
+            ])
+            .is_err()
+        );
         // Same for the `o`-key command.
-        assert!(Config::parse(
-            ["--output".to_string(), "--alt-open-cmd".to_string(), "x".to_string()]
-        )
-        .is_err());
+        assert!(
+            Config::parse([
+                "--output".to_string(),
+                "--alt-open-cmd".to_string(),
+                "x".to_string()
+            ])
+            .is_err()
+        );
         assert!(run_config(&["--output"]).output);
     }
 
@@ -2558,22 +3026,35 @@ mod tests {
 
     #[test]
     fn since_cutoff_is_midnight_for_today() {
-        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 14, 23, 0).unwrap();
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 5, 14, 23, 0)
+            .unwrap();
         let cutoff = Since::Today.cutoff(now);
         let dt: chrono::DateTime<chrono::Local> = cutoff.into();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-05 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-08-05 00:00:00"
+        );
         // 1d = 24h before now, to the second.
         let cutoff = Since::Days(1).cutoff(now);
         let dt: chrono::DateTime<chrono::Local> = cutoff.into();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-04 14:23:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-08-04 14:23:00"
+        );
     }
 
     #[test]
     fn since_yesterday_cutoff_is_the_previous_local_midnight() {
-        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 14, 23, 0).unwrap();
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 5, 14, 23, 0)
+            .unwrap();
         let cutoff = Since::Yesterday.cutoff(now);
         let dt: chrono::DateTime<chrono::Local> = cutoff.into();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-04 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-08-04 00:00:00"
+        );
     }
 
     #[test]
@@ -2582,7 +3063,10 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let expected = chrono::Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let expected = chrono::Local
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .unwrap();
         let cutoff = midnight_cutoff(midnight, &mut |m| {
             assert_eq!(m, midnight, "probes the requested day first");
             chrono::LocalResult::Single(expected)
@@ -2599,7 +3083,10 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let early = chrono::Local.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let early = chrono::Local
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .unwrap();
         let late = early + chrono::Duration::hours(1);
         let cutoff = midnight_cutoff(midnight, &mut |_| {
             chrono::LocalResult::Ambiguous(early, late)
@@ -2650,7 +3137,9 @@ mod tests {
     #[test]
     fn filter_entries_applies_text_and_since() {
         use std::time::{Duration, UNIX_EPOCH};
-        let now = chrono::Local.with_ymd_and_hms(2026, 8, 5, 12, 0, 0).unwrap();
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 5, 12, 0, 0)
+            .unwrap();
         let mk = |rel: &str, age_h: u64| FileEntry {
             path: p(&format!("/r/{rel}")),
             rel: p(rel),
@@ -2680,6 +3169,17 @@ mod tests {
     }
 
     #[test]
+    fn view_flag_parses_and_rejects_unknown() {
+        assert_eq!(run_config(&[]).view, View::Mtime); // デフォルト
+        assert_eq!(run_config(&["--view", "read"]).view, View::Read);
+        assert_eq!(run_config(&["--view", "mtime"]).view, View::Mtime);
+        // 不正値は即エラー（既存フラグと同じ流儀）。
+        assert!(Config::parse(["--view".to_string(), "bogus".to_string()]).is_err());
+        // 値の欠落もエラー。
+        assert!(Config::parse(["--view".to_string()]).is_err());
+    }
+
+    #[test]
     fn files_flag_parses() {
         let c = run_config(&["--files"]);
         assert!(c.files);
@@ -2692,11 +3192,267 @@ mod tests {
         assert!(Config::parse(["--format".to_string(), "bogus".to_string()]).is_err());
     }
 
+    // --- read ビュー（fixture ベースの契約テスト） -------------------------
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/testdata")
+            .join(name)
+    }
+
+    /// fixture の claude + pi ログを filter_root してマージした LogData
+    /// （正典: root は /Users/nagata/proj）。
+    fn fixture_log() -> readlog::LogData {
+        let root = Path::new("/Users/nagata/proj");
+        let claude =
+            readlog::parse_log(&fixture("claude-session.jsonl"), readlog::Backend::Claude).unwrap();
+        let pi = readlog::parse_log(&fixture("pi-session.jsonl"), readlog::Backend::Pi).unwrap();
+        let mut log = readlog::filter_root(claude, root);
+        let pi = readlog::filter_root(pi, root);
+        log.reads.extend(pi.reads);
+        log.edits.extend(pi.edits);
+        log
+    }
+
+    /// fixture の read 対象がスキャンに存在するツリー（+ ログに出ない
+    /// src/other.rs）。
+    fn fixture_entries() -> Vec<FileEntry> {
+        let mk = |rel: &str| FileEntry {
+            path: p(&format!("/r/{rel}")),
+            rel: p(rel),
+            rel_lower: rel.to_lowercase(),
+            mtime: std::time::UNIX_EPOCH,
+            ctime: std::time::UNIX_EPOCH,
+            is_dir: false,
+            size: 0,
+        };
+        vec![
+            mk("src/main.rs"),
+            mk("src/files.rs"),
+            mk("README.md"),
+            mk("src/other.rs"),
+        ]
+    }
+
+    /// 現在の表示行（フィルタ済み read 行）の相対パス一覧。
+    fn visible_rels(app: &App) -> Vec<String> {
+        app.visible
+            .iter()
+            .filter_map(|r| match r {
+                Row::File(i) => Some(app.files[app.read_rows[*i].idx].rel.display().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn read_view_builds_rows_sorted_by_read_time_and_seeds_fresh() {
+        let mut app = test_app(fixture_entries());
+        app.view = View::Read;
+        app.read_log = fixture_log();
+        app.rebuild_visible(None);
+        // 表示行: read 時刻降順 = files.rs (01:14Z) → main.rs (01:12Z) →
+        // README.md (01:10:05Z)。ログに出ない src/other.rs は出ない。
+        assert_eq!(
+            visible_rels(&app),
+            vec!["src/files.rs", "src/main.rs", "README.md"]
+        );
+        // メタデータ: 畳み込み後回数と read 後編集マーカー。
+        let main = app
+            .read_rows
+            .iter()
+            .find(|r| app.files[r.idx].rel == p("src/main.rs"))
+            .expect("main.rs row");
+        assert_eq!(main.read_count, 4, "claude 2 + pi 2（畳み込み後）");
+        assert!(main.edited);
+        // fresh シード: 初回ビルドで全行が記録される（READ_FRESH_WINDOW）。
+        assert_eq!(app.read_first_seen.len(), 3);
+        // 再ビルド（データ不変）で新規シードは増えない。
+        app.rebuild_visible(None);
+        assert_eq!(app.read_first_seen.len(), 3);
+        // `/` フィルタは相対パスに対して既存どおり効く。
+        app.filter = ".rs".into();
+        app.rebuild_visible(None);
+        assert_eq!(visible_rels(&app), vec!["src/files.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn read_line_renders_count_edit_badges_and_fresh_accent() {
+        let mut app = test_app(fixture_entries());
+        app.view = View::Read;
+        app.read_log = fixture_log();
+        app.rebuild_visible(None);
+        let now = chrono::Local::now();
+        let idx = app
+            .read_rows
+            .iter()
+            .position(|r| app.files[r.idx].rel == p("src/main.rs"))
+            .expect("main.rs row");
+        let line = read_line(&app, idx, 80, false, now);
+        let s = line.to_string();
+        assert!(s.contains("×4"), "read count badge: {s}");
+        assert!(s.contains("●"), "read 後編集マーカー: {s}");
+        // fresh（初回ビルド直後）: 既存の 1 時間以内ハイライトと同じ見た目
+        // （イタリック）がバッジと時刻に付く。
+        let count = line
+            .spans
+            .iter()
+            .find(|sp| sp.content == "×4")
+            .expect("×4 span");
+        assert!(
+            count.style.add_modifier.contains(Modifier::ITALIC),
+            "fresh 行はイタリック: {s}"
+        );
+        // fresh ウィンドウが切れた行（シードなし）はイタリックが消える。
+        app.read_first_seen.clear();
+        let line = read_line(&app, idx, 80, false, now);
+        let count = line
+            .spans
+            .iter()
+            .find(|sp| sp.content == "×4")
+            .expect("×4 span");
+        assert!(
+            !count.style.add_modifier.contains(Modifier::ITALIC),
+            "fresh 切れは通常表示"
+        );
+    }
+
+    #[test]
+    fn read_view_away_reads_re_seed_on_focus_return() {
+        let mut app = test_app(fixture_entries());
+        app.view = View::Read;
+        app.read_log = fixture_log();
+        app.rebuild_visible(None);
+        // away に入る前に fresh シードが揃っている。
+        assert_eq!(app.read_first_seen.len(), 3);
+        app.focus_lost();
+        // away 中に新パス（src/other.rs の read）がログに到着。
+        app.read_log.reads.push(readlog::ReadRecord {
+            path: p("src/other.rs"),
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        });
+        app.rebuild_visible(None);
+        assert_eq!(
+            app.away_reads,
+            vec![p("src/other.rs")],
+            "away 中の新規 read を記録"
+        );
+        // 復帰: away 中に到着した新規 read は fresh ウィンドウへ再シードされる
+        // （シードを過去にずらして「fresh 切れ」を再現してから復帰する）。
+        app.read_first_seen.insert(
+            p("src/other.rs"),
+            Instant::now() - READ_FRESH_WINDOW - Duration::from_secs(1),
+        );
+        app.focus_gained();
+        assert!(
+            app.read_first_seen
+                .get(&p("src/other.rs"))
+                .is_some_and(|t| t.elapsed() < READ_FRESH_WINDOW),
+            "復帰時ハイライト: away 中の新規 read が fresh に戻る"
+        );
+        assert!(app.away_reads.is_empty(), "復帰で away キューは空に");
+    }
+
+    #[test]
+    fn log_signature_gate_tracks_mtime_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("log.jsonl");
+        assert_eq!(log_signature(&f), None, "存在しないファイルは None");
+        std::fs::write(&f, "a").unwrap();
+        let s1 = log_signature(&f).expect("after create");
+        // 追記で (mtime, size) が変わる → 別シグネチャ（再パース対象）。
+        let mut h = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        use std::io::Write;
+        writeln!(h, "b").unwrap();
+        drop(h);
+        let s2 = log_signature(&f).expect("after append");
+        assert_ne!(s1, s2, "追記でシグネチャが変わる");
+        assert_eq!(log_signature(&f), Some(s2), "同じファイルは同じシグネチャ");
+        // 削除で None に戻る（消えたログは再パース対象）。
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(log_signature(&f), None);
+    }
+
+    #[test]
+    fn collect_read_logs_merges_sorted_by_time() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2 本のログ（claude 形式 + pi 形式）を tempdir に置く。
+        let claude = dir.path().join("c.jsonl");
+        let pi = dir.path().join("p.jsonl");
+        let claude_line = |ts: &str, path: &str| {
+            serde_json::json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "name": "Read", "input": { "file_path": path } }
+                    ],
+                },
+                "timestamp": ts,
+            })
+            .to_string()
+        };
+        let pi_line = |ts: &str, path: &str| {
+            serde_json::json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "toolCall", "name": "read", "arguments": { "path": path } }
+                    ],
+                },
+                "timestamp": ts,
+            })
+            .to_string()
+        };
+        std::fs::write(
+            &claude,
+            format!(
+                "{}\n{}\n",
+                claude_line("2026-08-11T01:10:00Z", "/r/a.rs"),
+                claude_line("2026-08-11T01:12:00Z", "/r/a.rs")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &pi,
+            format!(
+                "{}\n{}\n",
+                pi_line("2026-08-11T01:11:00Z", "/r/b.rs"),
+                pi_line("2026-08-11T01:09:00Z", "/r/a.rs")
+            ),
+        )
+        .unwrap();
+        let mut cache: HashMap<PathBuf, readlog::LogData> = HashMap::new();
+        for (backend, path) in [
+            (readlog::Backend::Claude, claude),
+            (readlog::Backend::Pi, pi),
+        ] {
+            let data = readlog::parse_log(&path, backend).unwrap();
+            cache.insert(path, readlog::filter_root(data, Path::new("/r")));
+        }
+        let merged = collect_read_logs(&cache);
+        // 時系列順にマージ（ログ間の並びは時間で整列）。
+        assert_eq!(merged.reads.len(), 4);
+        assert!(merged.reads.windows(2).all(|w| w[0].at <= w[1].at));
+        assert_eq!(merged.reads[0].path, PathBuf::from("a.rs"));
+        assert_eq!(
+            merged.reads[0].at,
+            std::time::SystemTime::from(
+                chrono::DateTime::parse_from_rfc3339("2026-08-11T01:09:00Z").unwrap()
+            )
+        );
+        assert_eq!(merged.reads[2].path, PathBuf::from("b.rs"));
+    }
+
     #[test]
     fn preview_flag_parses_modes() {
         assert_eq!(run_config(&["--preview", "on"]).preview, PreviewMode::On);
         assert_eq!(run_config(&["--preview", "off"]).preview, PreviewMode::Off);
-        assert_eq!(run_config(&["--preview", "auto"]).preview, PreviewMode::Auto);
+        assert_eq!(
+            run_config(&["--preview", "auto"]).preview,
+            PreviewMode::Auto
+        );
         assert!(Config::parse(["--preview".to_string(), "bogus".to_string()]).is_err());
         assert_eq!(run_config(&[]).preview, PreviewMode::Auto); // default
     }
@@ -2738,8 +3494,14 @@ mod tests {
 
     #[test]
     fn help_and_version_short_circuit() {
-        assert!(matches!(Config::parse(["--help".to_string()]), Ok(Action::Help)));
-        assert!(matches!(Config::parse(["-V".to_string()]), Ok(Action::Version)));
+        assert!(matches!(
+            Config::parse(["--help".to_string()]),
+            Ok(Action::Help)
+        ));
+        assert!(matches!(
+            Config::parse(["-V".to_string()]),
+            Ok(Action::Version)
+        ));
     }
 
     #[test]
@@ -2811,6 +3573,14 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         };
         app.rebuild_visible(None);
@@ -2837,8 +3607,7 @@ mod tests {
             path: p(&format!("/r/{rel}")),
             rel: p(rel),
             rel_lower: rel.to_lowercase(),
-            mtime: UNIX_EPOCH
-                + StdDuration::from_secs(now.timestamp() as u64 - age_h * 3600),
+            mtime: UNIX_EPOCH + StdDuration::from_secs(now.timestamp() as u64 - age_h * 3600),
             ctime: UNIX_EPOCH,
             is_dir: false,
             size: 0,
@@ -2874,10 +3643,22 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         };
         app.rebuild_visible(None);
-        assert_eq!(app.visible_count(), 1, "--since 1d keeps only the fresh file");
+        assert_eq!(
+            app.visible_count(),
+            1,
+            "--since 1d keeps only the fresh file"
+        );
     }
 
     #[test]
@@ -2915,6 +3696,14 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         };
         app.rebuild_visible(None);
@@ -2973,12 +3762,23 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         };
         // Focused: edits don't accumulate.
         std::fs::write(&f, "v2").unwrap();
         app.refresh_if_changed();
-        assert!(app.away_changes.is_empty(), "focused edits are not away-changes");
+        assert!(
+            app.away_changes.is_empty(),
+            "focused edits are not away-changes"
+        );
         // Away: edits stack up, deduped, in first-seen order.
         app.focus_lost();
         std::fs::write(&f, "v3").unwrap();
@@ -3032,6 +3832,14 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         };
         // 10 file rows, 5 visible; cursor at 9.
@@ -3048,18 +3856,33 @@ mod tests {
     #[test]
     fn fit_path_keeps_name_full_before_truncating() {
         // Fits: nothing truncated.
-        assert_eq!(fit_path("src/util/", "main.rs", 20), ("src/util/".into(), "main.rs".into()));
+        assert_eq!(
+            fit_path("src/util/", "main.rs", 20),
+            ("src/util/".into(), "main.rs".into())
+        );
         // Name + dir overflow: the dir shrinks at component boundaries,
         // keeping the tail (components closest to the name).
-        assert_eq!(fit_path("src/util/", "main.rs", 14), ("…/util/".into(), "main.rs".into()));
-        assert_eq!(fit_path("a/very/long/dir/", "main.rs", 20), ("…/long/dir/".into(), "main.rs".into()));
+        assert_eq!(
+            fit_path("src/util/", "main.rs", 14),
+            ("…/util/".into(), "main.rs".into())
+        );
+        assert_eq!(
+            fit_path("a/very/long/dir/", "main.rs", 20),
+            ("…/long/dir/".into(), "main.rs".into())
+        );
         // Not even one dir component fits: the dir is dropped entirely.
-        assert_eq!(fit_path("src/util/", "main.rs", 8), ("".into(), "main.rs".into()));
+        assert_eq!(
+            fit_path("src/util/", "main.rs", 8),
+            ("".into(), "main.rs".into())
+        );
         // The name alone doesn't fit: its head is kept with "…".
         assert_eq!(fit_path("", "main.rs", 4), ("".into(), "mai…".into()));
         assert_eq!(fit_path("src/", "main.rs", 4), ("".into(), "mai…".into()));
         // Root-level files: no dir part.
-        assert_eq!(fit_path("", "README.md", 20), ("".into(), "README.md".into()));
+        assert_eq!(
+            fit_path("", "README.md", 20),
+            ("".into(), "README.md".into())
+        );
     }
 
     #[test]
@@ -3114,6 +3937,14 @@ mod tests {
             away_changes: Vec::new(),
             git: None,
             uncommitted_only: false,
+            view: View::Mtime,
+            read_rows: Vec::new(),
+            read_log: readlog::LogData::default(),
+            read_cache: HashMap::new(),
+            read_sig: HashMap::new(),
+            read_first_seen: HashMap::new(),
+            away_reads: Vec::new(),
+            last_log_poll: Instant::now(),
             running: true,
         }
     }
@@ -3122,7 +3953,10 @@ mod tests {
     fn ctrl_c_quits_like_q() {
         let mut app = test_app(Vec::new());
         on_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL, None);
-        assert!(!app.running, "Ctrl+C quits (raw mode eats the tty's SIGINT)");
+        assert!(
+            !app.running,
+            "Ctrl+C quits (raw mode eats the tty's SIGINT)"
+        );
         // A plain `c` (no control) must NOT quit.
         let mut app = test_app(Vec::new());
         on_key(&mut app, KeyCode::Char('c'), KeyModifiers::empty(), None);
@@ -3513,10 +4347,19 @@ mod tests {
         let mut out = Vec::new();
         enter_tui_modes(&mut out).unwrap();
         let ansi = String::from_utf8(out).unwrap();
-        assert!(ansi.contains("\x1b[?1004h"), "EnableFocusChange missing: {ansi:?}");
-        assert!(ansi.contains("\x1b[?1049h"), "EnterAlternateScreen missing: {ansi:?}");
+        assert!(
+            ansi.contains("\x1b[?1004h"),
+            "EnableFocusChange missing: {ansi:?}"
+        );
+        assert!(
+            ansi.contains("\x1b[?1049h"),
+            "EnterAlternateScreen missing: {ansi:?}"
+        );
         assert!(ansi.contains("\x1b[?25l"), "Hide missing: {ansi:?}");
-        assert!(ansi.contains("\x1b[?1000h"), "EnableMouseCapture missing: {ansi:?}");
+        assert!(
+            ansi.contains("\x1b[?1000h"),
+            "EnableMouseCapture missing: {ansi:?}"
+        );
     }
 
     #[test]
@@ -3597,8 +4440,9 @@ mod tests {
         if !git::git_available() {
             return None;
         }
-        let base =
-            std::env::temp_dir().canonicalize().unwrap_or_else(|_| std::env::temp_dir());
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
         let dir = tempfile::Builder::new().tempdir_in(&base).unwrap();
         git::git(dir.path(), &["init", "-q"]);
         git::git(dir.path(), &["config", "user.email", "t@t"]);
@@ -3667,7 +4511,11 @@ mod tests {
         app.git = git::GitCache::discover(dir.path());
         app.rescan();
         let now = chrono::Local::now();
-        let idx = app.files.iter().position(|e| e.rel == p("src/b.rs")).unwrap();
+        let idx = app
+            .files
+            .iter()
+            .position(|e| e.rel == p("src/b.rs"))
+            .unwrap();
         // Wide: marker and time coexist (`+1 now`).
         let wide = file_line(&app, idx, 80, false, now, false);
         assert!(
@@ -3711,7 +4559,9 @@ mod tests {
 
     #[test]
     fn git_markers_refresh_after_a_rescan() {
-        let Some(dir) = git_repo(&[("f.md", "one\n")]) else { return };
+        let Some(dir) = git_repo(&[("f.md", "one\n")]) else {
+            return;
+        };
         let mut app = test_app(Vec::new());
         app.root = dir.path().to_path_buf();
         app.git = git::GitCache::discover(dir.path());
@@ -3719,7 +4569,9 @@ mod tests {
         let now = chrono::Local::now();
         let idx = app.files.iter().position(|e| e.rel == p("f.md")).unwrap();
         assert!(
-            !file_line(&app, idx, 80, false, now, false).to_string().contains('+'),
+            !file_line(&app, idx, 80, false, now, false)
+                .to_string()
+                .contains('+'),
             "clean at commit"
         );
         // The agent edits the file; the next rescan (post-Enter flow)
@@ -3728,7 +4580,9 @@ mod tests {
         app.rescan();
         let idx = app.files.iter().position(|e| e.rel == p("f.md")).unwrap();
         assert!(
-            file_line(&app, idx, 80, false, now, false).to_string().contains("+1"),
+            file_line(&app, idx, 80, false, now, false)
+                .to_string()
+                .contains("+1"),
             "rescan refreshes the git snapshot"
         );
     }

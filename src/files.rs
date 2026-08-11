@@ -5,6 +5,7 @@
 //! the hidden/dirs display filters. Sort order and time clusters are pure
 //! functions so they are unit-testable with a controlled "now".
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,8 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use ignore::{DirEntry, WalkBuilder};
 use unicode_width::UnicodeWidthStr;
+
+use crate::readlog::LogData;
 
 /// Directories excluded on every scan, regardless of `--show-hidden`
 /// (spec: "常に除外"). Component-name match, like gitignore `name/`.
@@ -206,6 +209,86 @@ pub fn is_fresh(now: chrono::DateTime<Local>, t: chrono::DateTime<Local>) -> boo
     now.signed_duration_since(t) < chrono::Duration::minutes(60)
 }
 
+/// read ビューの 1 行（[`build_read_rows`] の出力。表示・ソート・クラスタ・
+/// バッジ計算はすべてここで済ませる）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadRow {
+    /// スキャンエントリ（`entries`）へのインデックス。行のファイル情報は
+    /// ここから引く（read ビューも既存のファイル行と同じレイアウト）。
+    pub idx: usize,
+    /// 最後に read された時刻（行の時刻表示・ソート・クラスタ基準）。
+    pub last_read: SystemTime,
+    /// 畳み込み後の read 回数（`×N` バッジ）。
+    pub read_count: usize,
+    /// read 後に Edit/Write されたファイル（`●` マーカー）。
+    pub edited: bool,
+    /// read 時刻基準のクラスタ（Today/Yesterday/日付）。
+    pub cluster: Cluster,
+}
+
+/// read ログ（`filter_root` 済み・複数ログをマージ済み）から表示行を
+/// 構築する純関数。
+///
+/// - 表示対象: read されたファイルのうち、現在のスキャン `entries` に
+///   存在するものだけ（消えたファイルは出さない）。
+/// - ソート: read 時刻降順（最後に read された順 — 再 read で上に浮く）。
+///   タイは相対パスで決定的に。
+/// - 行ごとに: 最後の read 時刻 / 畳み込み後回数 / read 後編集マーカー /
+///   read 時刻基準のクラスタを計算する。
+pub fn build_read_rows(
+    log: &LogData,
+    entries: &[FileEntry],
+    now: chrono::DateTime<Local>,
+) -> Vec<ReadRow> {
+    // スキャンに存在する相対パス → エントリ index（存在チェックを兼ねる）。
+    let mut idx_of: HashMap<&Path, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        idx_of.insert(e.rel.as_path(), i);
+    }
+    // パスごとの集約（read 回数・最初/最後の read 時刻）。
+    let mut acc: HashMap<PathBuf, (usize, SystemTime, SystemTime)> = HashMap::new();
+    for r in &log.reads {
+        if !idx_of.contains_key(r.path.as_path()) {
+            continue; // スキャンに存在しないファイルは表示しない
+        }
+        let (count, first, last) = acc.entry(r.path.clone()).or_insert((0, r.at, r.at));
+        *count += 1;
+        if r.at < *first {
+            *first = r.at;
+        }
+        if r.at > *last {
+            *last = r.at;
+        }
+    }
+    // 編集マーカー: 「read 後に Edit/Write された」= 編集時刻が最初の
+    // read 時刻以降にある（read してから手が入れられたファイル）。
+    let mut edited: HashSet<PathBuf> = HashSet::new();
+    for e in &log.edits {
+        if acc.get(&e.path).is_some_and(|&(_, first, _)| e.at >= first) {
+            edited.insert(e.path.clone());
+        }
+    }
+    let mut rows: Vec<ReadRow> = acc
+        .iter()
+        .filter_map(|(path, &(count, _, last))| {
+            let &idx = idx_of.get(path.as_path())?;
+            Some(ReadRow {
+                idx,
+                last_read: last,
+                read_count: count,
+                edited: edited.contains(path),
+                cluster: cluster_of(to_local(last), now),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.last_read
+            .cmp(&a.last_read)
+            .then_with(|| entries[a.idx].rel.cmp(&entries[b.idx].rel))
+    });
+    rows
+}
+
 /// Case-insensitive substring match on the relative path. A leading `/` in
 /// the filter is stripped so the spec's examples work: `/main.rs` matches
 /// `src/main.rs`, `/src/` matches `src/…` paths, `/.md` matches `.md`
@@ -280,8 +363,7 @@ fn entry_filtered(entry: &DirEntry, root: &Path, show_hidden: bool) -> bool {
 /// display flags. Does not follow directory symlinks. Errors on individual
 /// entries (unreadable dirs, races) are skipped; only a missing root is fatal.
 pub fn scan(root: &Path, show_hidden: bool, show_dirs: bool) -> Result<Vec<FileEntry>> {
-    let meta = std::fs::metadata(root)
-        .with_context(|| format!("scanning {}", root.display()))?;
+    let meta = std::fs::metadata(root).with_context(|| format!("scanning {}", root.display()))?;
     if !meta.is_dir() {
         anyhow::bail!("{} is not a directory", root.display());
     }
@@ -302,16 +384,17 @@ pub fn scan(root: &Path, show_hidden: bool, show_dirs: bool) -> Result<Vec<FileE
     let mut out = Vec::new();
     for result in builder.build() {
         let Ok(entry) = result else { continue };
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         if ft.is_dir() && !show_dirs {
             continue;
         }
         let path = entry.path().to_path_buf();
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_path_buf();
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         // The root itself is not a list entry.
         if rel.as_os_str().is_empty() {
             continue;
@@ -468,17 +551,18 @@ mod tests {
     #[test]
     fn changed_paths_lists_adds_edits_and_deletions() {
         // edit b.md (mtime bump), add d.md, delete a.md.
-        let old = vec![entry("a.md", t(10)), entry("b.md", t(10)), entry("c.md", t(10))];
+        let old = vec![
+            entry("a.md", t(10)),
+            entry("b.md", t(10)),
+            entry("c.md", t(10)),
+        ];
         let new = vec![
             entry("b.md", t(20)),
             entry("c.md", t(10)),
             entry("d.md", t(5)),
         ];
         let binding = changed_paths(&old, &new);
-        let names: Vec<&str> = binding
-            .iter()
-            .map(|p| p.to_str().unwrap())
-            .collect();
+        let names: Vec<&str> = binding.iter().map(|p| p.to_str().unwrap()).collect();
         // New-list order, deletions appended last.
         assert_eq!(names, vec!["/root/b.md", "/root/d.md", "/root/a.md"]);
         // No changes at all → empty.
@@ -538,8 +622,14 @@ mod tests {
         assert!(matches_filter(&entry("Σίσυφος.txt", t(1)), "σίσυφος"));
         // İ (I with dot above) expands to two chars when lowercased
         // (i + combining dot): the match needs the expanded form.
-        assert!(matches_filter(&entry("\u{130}stanbul.txt", t(1)), "i\u{307}stanbul"));
-        assert!(!matches_filter(&entry("\u{130}stanbul.txt", t(1)), "istanbul"));
+        assert!(matches_filter(
+            &entry("\u{130}stanbul.txt", t(1)),
+            "i\u{307}stanbul"
+        ));
+        assert!(!matches_filter(
+            &entry("\u{130}stanbul.txt", t(1)),
+            "istanbul"
+        ));
     }
 
     /// Build a temp tree and scan it, asserting which entries survive.
@@ -550,10 +640,10 @@ mod tests {
             "src/util/mod.rs",
             "README.md",
             ".gitignore",
-            ".git/config",          // always ignored
-            "target/debug/x",       // always ignored
+            ".git/config",           // always ignored
+            "target/debug/x",        // always ignored
             "node_modules/pkg/x.js", // always ignored
-            "__pycache__/x.pyc",    // always ignored
+            "__pycache__/x.pyc",     // always ignored
             ".claude/settings.json", // hidden by default, never always-ignored
             ".pi/agent.md",          // hidden by default, never always-ignored
             "sub/.DS_Store",         // always ignored even when hidden shown
@@ -673,5 +763,143 @@ mod tests {
     #[test]
     fn empty_filter_matches_everything() {
         assert!(matches_filter(&entry("anything", t(1)), ""));
+    }
+
+    // --- read ビュー（fixture ベースの契約テスト） -------------------------
+
+    /// fixture の claude + pi ログを filter_root してマージした LogData
+    /// （正典: root は /Users/nagata/proj）。
+    fn fixture_log() -> LogData {
+        let root = Path::new("/Users/nagata/proj");
+        let fixture = |name: &str| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/testdata")
+                .join(name)
+        };
+        let claude = crate::readlog::parse_log(
+            &fixture("claude-session.jsonl"),
+            crate::readlog::Backend::Claude,
+        )
+        .unwrap();
+        let pi =
+            crate::readlog::parse_log(&fixture("pi-session.jsonl"), crate::readlog::Backend::Pi)
+                .unwrap();
+        let mut log = crate::readlog::filter_root(claude, root);
+        let pi = crate::readlog::filter_root(pi, root);
+        log.reads.extend(pi.reads);
+        log.edits.extend(pi.edits);
+        log
+    }
+
+    /// fixture の read 対象がスキャンに存在するツリー（+ ログに出ない
+    /// src/other.rs）。時刻は表示対象の存在判定にのみ使う。
+    fn fixture_entries() -> Vec<FileEntry> {
+        vec![
+            entry("src/main.rs", t(1_700_000_000)),
+            entry("src/files.rs", t(1_700_000_000)),
+            entry("README.md", t(1_700_000_000)),
+            entry("src/other.rs", t(1_700_000_000)),
+        ]
+    }
+
+    #[test]
+    fn build_read_rows_merges_fixture_logs_by_read_time_desc() {
+        let log = fixture_log();
+        let entries = fixture_entries();
+        // now は fixture の最大 read 時刻の 1 時間後。全 read が 14 分以内に
+        // 収まるので、どのタイムゾーンでも全行 Today になる。
+        let max_read = log.reads.iter().map(|r| r.at).max().expect("fixture reads");
+        let now = to_local(max_read) + chrono::Duration::hours(1);
+        let rows = build_read_rows(&log, &entries, now);
+        // 表示行: read 時刻降順 = files.rs (01:14Z) → main.rs (01:12Z) →
+        // README.md (01:10:05Z)。ログに出ない src/other.rs は出ない。
+        let rels: Vec<&str> = rows
+            .iter()
+            .map(|r| entries[r.idx].rel.to_str().unwrap())
+            .collect();
+        assert_eq!(rels, vec!["src/files.rs", "src/main.rs", "README.md"]);
+        // 各バッジ: 畳み込み後 read 回数と「read 後に Edit/Write された」マーカー。
+        let main = rows
+            .iter()
+            .find(|r| entries[r.idx].rel == Path::new("src/main.rs"))
+            .expect("main.rs row");
+        assert_eq!(main.read_count, 4, "claude 2 + pi 2（畳み込み後）");
+        assert!(
+            main.edited,
+            "read 後に Edit されている（claude 01:01Z / pi 01:10:30Z）"
+        );
+        let files = rows
+            .iter()
+            .find(|r| entries[r.idx].rel == Path::new("src/files.rs"))
+            .expect("files.rs row");
+        assert_eq!(files.read_count, 2, "claude 1 + pi 1");
+        assert!(!files.edited);
+        let readme = rows
+            .iter()
+            .find(|r| entries[r.idx].rel == Path::new("README.md"))
+            .expect("README row");
+        assert_eq!(readme.read_count, 2, "claude 1 + pi 1");
+        assert!(!readme.edited);
+        // クラスタは read 時刻基準（全 read が now の 1 時間以内 → Today）。
+        assert!(rows.iter().all(|r| r.cluster == Cluster::Today));
+    }
+
+    #[test]
+    fn build_read_rows_drops_files_missing_from_the_scan() {
+        let log = fixture_log();
+        let mut entries = fixture_entries();
+        // スキャンから src/files.rs が消えた（ファイル削除）→ 行も消える。
+        entries.retain(|e| e.rel != Path::new("src/files.rs"));
+        let max_read = log.reads.iter().map(|r| r.at).max().expect("fixture reads");
+        let now = to_local(max_read) + chrono::Duration::hours(1);
+        let rows = build_read_rows(&log, &entries, now);
+        let rels: Vec<&str> = rows
+            .iter()
+            .map(|r| entries[r.idx].rel.to_str().unwrap())
+            .collect();
+        assert_eq!(rels, vec!["src/main.rs", "README.md"]);
+    }
+
+    #[test]
+    fn build_read_rows_clusters_by_read_time() {
+        // クラスタ境界は read 時刻基準（ローカル壁時計で組み立てるので
+        // どのタイムゾーンでも同じ期待値）。
+        let n = local(2026, 8, 11, 14, 0);
+        let to = |dt: chrono::DateTime<Local>| -> SystemTime { dt.into() };
+        let log = LogData {
+            reads: vec![
+                crate::readlog::ReadRecord {
+                    path: PathBuf::from("now.rs"),
+                    at: to(local(2026, 8, 11, 13, 0)),
+                },
+                crate::readlog::ReadRecord {
+                    path: PathBuf::from("yesterday.rs"),
+                    at: to(local(2026, 8, 10, 9, 0)),
+                },
+                crate::readlog::ReadRecord {
+                    path: PathBuf::from("old.rs"),
+                    at: to(local(2026, 8, 8, 9, 0)),
+                },
+            ],
+            edits: Vec::new(),
+        };
+        let entries = vec![
+            entry("now.rs", to(local(2026, 8, 11, 13, 0))),
+            entry("yesterday.rs", to(local(2026, 8, 10, 9, 0))),
+            entry("old.rs", to(local(2026, 8, 8, 9, 0))),
+        ];
+        let rows = build_read_rows(&log, &entries, n);
+        let cluster_of = |rel: &str| {
+            rows.iter()
+                .find(|r| entries[r.idx].rel == Path::new(rel))
+                .map(|r| r.cluster)
+                .expect("row")
+        };
+        assert_eq!(cluster_of("now.rs"), Cluster::Today);
+        assert_eq!(cluster_of("yesterday.rs"), Cluster::Yesterday);
+        assert_eq!(
+            cluster_of("old.rs"),
+            Cluster::Date(NaiveDate::from_ymd_opt(2026, 8, 8).unwrap())
+        );
     }
 }
