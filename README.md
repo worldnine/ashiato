@@ -83,7 +83,7 @@ Changes are detected by `(mtime, size, is_dir)` — an edit that keeps all three
 
 `r` toggles a second view: **the files your coding agent has read** (via its `Read` tool), parsed from the agent's own session logs — Claude Code (`~/.claude/projects/<slug>/<session>.jsonl`) and pi (`~/.pi/agent/sessions/<slug>/<session>.jsonl`). While mtime says *what the agent changed*, the read view shows *how it got there* — its exploration path.
 
-- Rows show the **last touch time** (same relative/HH:MM format; read and bash-mention both count as a touch, so files that were never `Read` still appear when the agent's commands pointed at them) and a `●` marker for files **edited after being touched** — the review-critical pair. No count badges: they didn't discriminate anything.
+- Rows show the **last touch time** (same relative/HH:MM format; read and bash-mention both count as a touch, so files that were never `Read` still appear when the agent's commands pointed at them). No markers or count badges: they didn't discriminate anything.
 - The view is **live**: while it's on screen, the session logs are watched every 500ms (same `(mtime, size)` signature gate as the git integration); new files pop to the top with a fresh accent, known files re-read float up.
 - Files read but since deleted are dropped; the `/` filter and `u` (uncommitted) still work.
 - `--files --view read` prints the read list (read-time order) for fzf, `--format tsv` emits read times.

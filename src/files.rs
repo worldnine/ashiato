@@ -5,7 +5,7 @@
 //! the hidden/dirs display filters. Sort order and time clusters are pure
 //! functions so they are unit-testable with a controlled "now".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -219,9 +219,6 @@ pub struct ReadRow {
     /// 最後に触れられた時刻（read と bash 参照のうち最新。行の時刻表示・
     /// ソート・クラスタ基準）。
     pub last_read: SystemTime,
-    /// 触れた後に Edit/Write されたファイル（`●` マーカー）。
-    /// 「後」は最初の接触（read または bash 参照）以降の意味。
-    pub edited: bool,
     /// 触れられた時刻基準のクラスタ（Today/Yesterday/日付）。
     pub cluster: Cluster,
 }
@@ -232,10 +229,10 @@ pub struct ReadRow {
 /// - 表示対象: read されたファイルと bash 参照されたファイルのうち、現在の
 ///   スキャン `entries` に存在するものだけ（消えたファイルは出さない。
 ///   bash 参照の候補はここで実在チェックされ、`ls` や存在しないパスは消える）。
-/// - read と bash 参照は区別せず「接触」として扱う（数値バッジは廃止）。
+/// - read と bash 参照は区別せず「接触」として扱う（マーカー・数値バッジは
+///   すべて廃止。行は「触れた順 + 時刻」のみ）。
 /// - ソート: 最後に触れられた時刻降順 — 再 read や参照で上に浮く。
 ///   タイは相対パスで決定的に。
-/// - 行ごとに: 触れられた時刻 / 触れた後編集マーカー / クラスタを計算する。
 pub fn build_read_rows(
     log: &LogData,
     entries: &[FileEntry],
@@ -266,15 +263,6 @@ pub fn build_read_rows(
             *last = at;
         }
     }
-    // 編集マーカー: 「触れた後に Edit/Write された」= 編集時刻が最初の接触
-    // 以降にある。read または参照してから手が入れられたファイル —
-    // レビューで一番知りたい組み合わせ。
-    let mut edited: HashSet<PathBuf> = HashSet::new();
-    for e in &log.edits {
-        if acc.get(&e.path).is_some_and(|&(first, _)| e.at >= first) {
-            edited.insert(e.path.clone());
-        }
-    }
     let mut rows: Vec<ReadRow> = acc
         .iter()
         .filter_map(|(path, &(_, last))| {
@@ -282,7 +270,6 @@ pub fn build_read_rows(
             Some(ReadRow {
                 idx,
                 last_read: last,
-                edited: edited.contains(path),
                 cluster: cluster_of(to_local(last), now),
             })
         })
@@ -552,6 +539,11 @@ mod tests {
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// RFC3339 文字列から SystemTime（fixture の期待値用。readlog の解釈と同じ）。
+    fn at(s: &str) -> SystemTime {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().into()
     }
 
     #[test]
@@ -831,32 +823,20 @@ mod tests {
             rels,
             vec!["src/main.rs", "src/files.rs", "README.md", "Cargo.toml"]
         );
-        // 各マーカー: 触れた後編集（●）の有無。数値バッジ（×N / ~N）は
-        // 判別に役立たないため廃止し、行は「触れた順 + 時刻 + ●」のみ。
-        let main = rows
-            .iter()
-            .find(|r| entries[r.idx].rel == Path::new("src/main.rs"))
-            .expect("main.rs row");
-        assert!(
-            main.edited,
-            "触れた後に Edit されている（claude 01:01Z / pi 01:10:30Z）"
-        );
-        let files = rows
-            .iter()
-            .find(|r| entries[r.idx].rel == Path::new("src/files.rs"))
-            .expect("files.rs row");
-        assert!(!files.edited);
-        let readme = rows
-            .iter()
-            .find(|r| entries[r.idx].rel == Path::new("README.md"))
-            .expect("README row");
-        assert!(!readme.edited);
-        // read なし・bash 参照のみのファイルも行になる。
-        let cargo = rows
-            .iter()
-            .find(|r| entries[r.idx].rel == Path::new("Cargo.toml"))
-            .expect("Cargo.toml row");
-        assert!(!cargo.edited);
+        // 行は「触れた順 + 時刻」のみ（マーカー・数値バッジはすべて廃止）。
+        // 順序は最後の接触降順で、read と bash 参照の区別はしない。
+        let last_of = |rel: &str| -> SystemTime {
+            rows.iter()
+                .find(|r| entries[r.idx].rel == Path::new(rel))
+                .map(|r| r.last_read)
+                .expect(rel)
+        };
+        // main.rs は pi の bash 参照（01:15Z）が最後の接触。
+        assert_eq!(last_of("src/main.rs"), at("2026-08-11T01:15:00Z"));
+        assert_eq!(last_of("src/files.rs"), at("2026-08-11T01:14:00Z"));
+        // README.md は pi の read（01:10:05Z）が最後。Cargo.toml は参照のみ。
+        assert_eq!(last_of("README.md"), at("2026-08-11T01:10:05Z"));
+        assert_eq!(last_of("Cargo.toml"), at("2026-08-11T01:07:00Z"));
         // クラスタは触れられた時刻基準（全イベントが now の 1 時間以内 → Today）。
         assert!(rows.iter().all(|r| r.cluster == Cluster::Today));
     }

@@ -2688,16 +2688,12 @@ fn file_line(
 }
 
 /// read ビューの 1 行: 既存のファイル行と同じレイアウト（マーカー + dir +
-/// 名前）で、右側は `●`（触れた後に Edit/Write されたファイル）と最後に
-/// 触れられた時刻（format_time 再利用）だけ。数値バッジ（×N / ~N）と
-/// git マーカーは判別に役立たないため read ビューでは出さない（シンプルに）。
+/// 名前）+ 最後に触れられた時刻（format_time 再利用）だけ。マーカーや
+/// 数値バッジは判別に役立たないため read ビューでは出さない（シンプルに）。
 ///
 /// 新規に現れたファイル（fresh）は既存の 1 時間以内ハイライトと同じ見た目
-/// （時刻のイタリック）で表示し、バッジも同じアクセントにする。既知
-/// ファイルの再 read は行が上に浮くだけ（並びは build_read_rows が
-/// 触れられた時刻降順に保つ）。
-///
-/// 幅が足りないときの犠牲順は: 時刻 → `●`。
+/// （時刻のイタリック）で表示する。既知ファイルの再 read は行が上に浮く
+/// だけ（並びは build_read_rows が触れられた時刻降順に保つ）。
 fn read_line(
     app: &App,
     row_idx: usize,
@@ -2738,53 +2734,31 @@ fn read_line(
     let avail = width.saturating_sub(files::display_width(marker));
     let (dir, name) = fit_path(dir, &name, avail);
     let left_w = files::display_width(&dir) + files::display_width(&name);
-    let room = avail.saturating_sub(left_w).saturating_sub(2);
     // fresh = 新規に現れたファイル（到着から READ_FRESH_WINDOW 以内）。
     // 既存の 1 時間以内ハイライトと同じ見た目 = イタリック。
     let fresh = app
         .read_first_seen
         .get(&e.rel)
         .is_some_and(|t| t.elapsed() < READ_FRESH_WINDOW);
-    let badge_style = {
-        let mut s = base.add_modifier(Modifier::DIM);
-        if fresh {
-            s = s.add_modifier(Modifier::ITALIC);
-        }
-        s
-    };
     let mut time_style = base.add_modifier(Modifier::DIM);
     if fresh {
         time_style = time_style.add_modifier(Modifier::ITALIC);
     }
-    // 右側要素を優先順（● → 時刻）に詰める。
-    let mut right_spans: Vec<Span<'static>> = Vec::new();
-    let mut right_w = 0usize;
-    let mut push_right = |s: String, st: Style| {
-        let w = files::display_width(&s) + usize::from(!right_spans.is_empty());
-        if right_w + w <= room {
-            if !right_spans.is_empty() {
-                right_spans.push(Span::raw(" "));
-            }
-            right_w += w;
-            right_spans.push(Span::styled(s, st));
-        }
+    // 右側は時刻だけ（マーカー・数値バッジはすべて廃止）。
+    let time = format_time(now, to_local(row.last_read));
+    let time_w = files::display_width(&time);
+    let pad = avail.saturating_sub(left_w + 2 + time_w);
+    let right = if pad > 0 {
+        Span::styled(format!("{}{}", " ".repeat(pad), time), time_style)
+    } else {
+        Span::styled(time, time_style)
     };
-    if row.edited {
-        push_right("●".to_string(), badge_style);
-    }
-    push_right(format_time(now, to_local(row.last_read)), time_style);
     let mut spans = vec![
         Span::styled(marker, name_style),
         Span::styled(dir, base.fg(app.ui_border)),
         Span::styled(name, name_style),
     ];
-    if !right_spans.is_empty() {
-        spans.push(Span::styled(
-            " ".repeat(avail.saturating_sub(left_w + right_w)),
-            base,
-        ));
-        spans.extend(right_spans);
-    }
+    spans.push(right);
     Line::from(spans)
 }
 
@@ -3259,13 +3233,7 @@ mod tests {
             visible_rels(&app),
             vec!["src/files.rs", "src/main.rs", "README.md"]
         );
-        // メタデータ: 触れた後編集マーカー（数値バッジは廃止）。
-        let main = app
-            .read_rows
-            .iter()
-            .find(|r| app.files[r.idx].rel == p("src/main.rs"))
-            .expect("main.rs row");
-        assert!(main.edited);
+        // 行は「触れた順 + 時刻」のみ（マーカー・数値バッジはすべて廃止）。
         // fresh シード: 初回ビルドで全行が記録される（READ_FRESH_WINDOW）。
         assert_eq!(app.read_first_seen.len(), 3);
         // 再ビルド（データ不変）で新規シードは増えない。
@@ -3278,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn read_line_renders_edit_marker_and_fresh_accent() {
+    fn read_line_renders_time_and_fresh_accent() {
         let mut app = test_app(fixture_entries());
         app.view = View::Read;
         app.read_log = fixture_log();
@@ -3291,29 +3259,28 @@ mod tests {
             .expect("main.rs row");
         let line = read_line(&app, idx, 80, false, now);
         let s = line.to_string();
-        assert!(s.contains("●"), "触れた後編集マーカー: {s}");
-        assert!(!s.contains("×"), "数値バッジは廃止: {s}");
+        // マーカー・数値バッジはすべて廃止（右側は時刻のみ）。
+        assert!(!s.contains("●") && !s.contains("×"), "マーカー廃止: {s}");
         // fresh（初回ビルド直後）: 既存の 1 時間以内ハイライトと同じ見た目
-        // （イタリック）がバッジと時刻に付く。
-        let badge = line
+        // （イタリック）が時刻に付く。
+        let time = line
             .spans
             .iter()
-            .find(|sp| sp.content == "●")
-            .expect("● span");
-        assert!(
-            badge.style.add_modifier.contains(Modifier::ITALIC),
-            "fresh 行はイタリック: {s}"
+            .find(|sp| sp.style.add_modifier.contains(Modifier::ITALIC))
+            .expect("fresh 時刻 span");
+        // 時刻 span は右寄せパディング込みの内容なので trim して比較する。
+        assert_eq!(
+            time.content.trim(),
+            format_time(now, to_local(app.read_rows[idx].last_read))
         );
         // fresh ウィンドウが切れた行（シードなし）はイタリックが消える。
         app.read_first_seen.clear();
         let line = read_line(&app, idx, 80, false, now);
-        let badge = line
-            .spans
-            .iter()
-            .find(|sp| sp.content == "●")
-            .expect("● span");
         assert!(
-            !badge.style.add_modifier.contains(Modifier::ITALIC),
+            !line
+                .spans
+                .iter()
+                .any(|sp| sp.style.add_modifier.contains(Modifier::ITALIC)),
             "fresh 切れは通常表示"
         );
     }
