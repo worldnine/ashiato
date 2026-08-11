@@ -433,8 +433,8 @@ akapen = [
 [open]
 prepend_rules = [
   # md → akapen（Enter でレビュー、O で edit も選べる）
-  # マッチャーキー: yazi 25.5 系は name（v25.12.29 以降は url に改名）
-  { name = "*.md", use = [ "akapen", "edit" ] },
+  # マッチャーキー: 26.x は url（25.5 系までは name だった）
+  { url = "*.md", use = [ "akapen", "edit" ] },
 ]
 ```
 
