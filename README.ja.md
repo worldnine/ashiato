@@ -43,7 +43,6 @@ ashiato [directory] [flags]
 | `--files` | TUI なしで時間順パス一覧を出力（fzf 等へのデータソース） |
 | `--format <path\|tsv>` | `--files` の出力形式（tsv = `日時<TAB>名前<TAB>パス`） |
 | `--since <today\|yesterday\|Nd\|Nw>` | 時間カットオフ（`--files` の絞り込み + TUI の初期表示） |
-| `--view <mtime\|read>` | 起動時ビュー（`read` = エージェントが Read したファイルをライブ表示。`r` キーで切替） |
 | `--output` | 既定動作（stdout 出力）の明示指定。`--open-cmd` と排他 |
 
 `.gitignore` を尊重し（git リポジトリ外でも有効）、常時除外リスト（`.git/`、`node_modules/`、`target/`、`__pycache__/`、`.DS_Store`）を併用します。`.claude/` などのエージェント関連ディレクトリは**除外しません** — エージェントが生成したファイルこそレビュー対象だからです。
@@ -60,27 +59,12 @@ ashiato [directory] [flags]
 | `/` | インクリメンタルフィルタ（相対パスへの substring 一致） |
 | `\` | フィルタのテキストを保持したまま ON/OFF トグル（`:nohlsearch` モデル） |
 | `t` | ソート巡回 |
-| `r` | ビュー切替: mtime ビュー ↔ read ビュー（フッタに `[read]` バッジ） |
 | `Ctrl+h` | ドットディレクトリの表示切替 |
 | `d` | ディレクトリの表示切替 |
 | `u` | 「未コミット変更のあるファイルのみ」表示のトグル（git リポジトリ内のみ。未コミット行は右側に `+N -M`） |
 | `q` | 終了 |
 
 一覧は 2 秒ごとに再スキャンされ、エージェントが別ペインで編集したファイルがライブで浮かび上がります。カーソル・選択はパスで追従します。
-
-### read ビュー（エージェントが読んだファイル）
-
-`r` キーでもう一つのビューに切り替わります: **あなたのエージェントが Read ツールで読んだファイル**。データ源はエージェント自身のセッションログ — Claude Code（`~/.claude/projects/<slug>/<session>.jsonl`）と pi（`~/.pi/agent/sessions/<slug>/<session>.jsonl`）。mtime ビューが「何を直したか」なら、read ビューは「どう頭に入れたか」— エージェントの探索経路です。
-
-- 行の時刻は**最後に触れられた時刻**（相対 / HH:MM 表示。read と bash 参照の両方を「接触」として扱うので、Read されていないがコマンドが指したファイルも出現）。マーカーや数値バッジは判別に役立たないため一切なし（シンプルに）。
-- **ライブ更新**: 表示中はセッションログを 500ms 周期で監視（git 連携と同じ (mtime, size) シグネチャゲート）。新規ファイルが fresh アクセントで上に浮き、再 read された既知ファイルも浮き上がります。
-- read された後に消えたファイルは表示されません。`/` フィルタと `u`（未コミットのみ）もそのまま効きます。
-- `--files --view read` で read 順の一覧を fzf に渡せます（`--format tsv` の時刻は read 時刻）。
-
-```sh
-ashiato --view read .            # エージェントが今まさに読んでいるもののライブビュー
-ashiato . --view read --open-cmd "akapen {} --send-agent"  # 読んだものをレビュー
-```
 
 ### アウェイ差分（ターミナルフォーカス）
 
@@ -126,7 +110,6 @@ ashiato --files | fzf                                   # 時間順 × ファジ
 ashiato --files --format tsv | fzf --delimiter $'\t' \
   --with-nth 1..2 --preview 'bat --color=always {3}'    # 時間+名前表示、フルパスでプレビュー
 ashiato --files --since today | fzf                     # 今日触ったファイルだけ
-ashiato --files --view read | fzf                       # エージェントが read したファイル（read 時刻順）
 ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまとめてレビュー
 ```
 

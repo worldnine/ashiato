@@ -33,7 +33,6 @@ ashiato [directory] [flags]
 | `--files` | — | TUI を開かず、収集・ソート済みのパス一覧を stdout に出力して終了（パイプ / fzf 用のデータソース） |
 | `--format <path\|tsv>` | `path` | `--files` の出力形式。`tsv` は `YYYY-MM-DD HH:MM:SS<TAB>basename<TAB>path` の3フィールド（fzf の `--with-nth` / `--nth` / `{1}` `{2}` `{3}` で表示・検索・プレビューを自由に組み合わせられる） |
 | `--since <today\|yesterday\|Nd\|Nw>` | — | 時間カットオフ。`--files` では出力を絞り、**TUI では起動時から指定より新しいファイルのみ表示**（プレビュー・クラスタ・`\` トグル等がそのまま効く） |
-| `--view <mtime\|read>` | `mtime` | 起動時ビュー。`read` はエージェントが Read したファイルの一覧（下記「read ビュー」）。`r` キーで切替。不正値はエラーで即終了 |
 | `--output` | — | 出力モードの明示指定（既定動作と同じ）。`--open-cmd` と排他 |
 | `--theme <name>` | —（`Catppuccin Mocha`） | プレビューの syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス。light 自動検出時は `Solarized (light)`） |
 | `--light` / `--dark` | 自動検出 | light/dark の明示指定。OSC 11 でターミナル背景色を問い合わせ、輝度 128 超で light。応答なしは dark |
@@ -267,70 +266,6 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 
 ---
 
-## read ビュー（エージェントが読んだファイル）
-
-`r` キー（または `--view read`）で切り替わる第二のビュー。「AI エージェント
-（Claude Code / pi）が Read ツールで読んだファイル」を、最後に読んだ時刻順で
-表示する。mtime ビューが「何を直したか」、read ビューは「どう頭に入れたか」。
-セッションログが追記されるたびにライブで反映される（新着が上に浮く）。
-
-### データ源
-
-- `src/readlog.rs` がセッションログを発見・パースする:
-  - Claude Code: `~/.claude/projects/<slug>/*.jsonl`（`tool_use` name=Read/Edit/Write、input.file_path）
-  - pi: `~/.pi/agent/sessions/<slug>/*.jsonl`（`toolCall` name=read/edit/write、arguments.path）
-  - slug 一致ディレクトリ内の最新セッションを backend ごとに 1 本。
-    無ければ base 全走査から最新（root 外のレコードは filter_root が落とす）
-- 同一パスの Read が 60 秒以内に連続したら 1 回に畳む（Claude の offset
-  ページネーション対策。最初の時刻を採用）。Edit/Write は畳まない
-- 表示対象: read されたファイルのうち**現在のスキャンに存在するものだけ**
-  （消えたファイルは出ない）。複数ログ（claude + pi）はマージ
-- bash 参照: 両 backend の Bash ツールの command 文字列からパス候補を
-  **機械的に**抽出（空白分割 → クォート・末尾記号を除去 → `-` オプション・
-  `$` 変数・`=` 代入・`*` glob・`.` `/` を含まない裸トークンを除外）。
-  シェル構文は解釈しない（リダイレクト先・cp コピー先も「触った」として許容。
-  スペース入りファイル名は分割で壊れる）。候補はスキャン交差で実在確認され、
-  `ls` や存在しないパスは自然に消える
-- read と bash 参照は区別せず**「接触」**として扱う（マーカー・数値バッジは
-  廃止。リストの並びと時刻だけに使う）
-
-### 行の表示
-
-- 時刻列: **最後に触れられた時刻**（read と bash 参照のうち最新。format_time
-  再利用。1 時間以内は `now` / `Nm ago`、以降は HH:MM）
-- 右側は時刻のみ。マーカー（`●` 等）・git マーカー（`+N -M`）・数値バッジ
-  （`×N` / `~N`）は一切出さない（判別に役立たないため。シンプルに）
-- 新規に現れたファイルは fresh（イタリック）で、到着から 60 秒間目立つ
-- クラスタヘッダーは触れられた時刻基準（Today / Yesterday / 日付）
-
-### ライブ更新
-
-- read ビュー表示中はログを 500ms 周期でシグネチャ監視（git 連携と同じ
-  (mtime, size) ゲート）。伸びたログだけ再パースし、変化があれば行を組み直す
-- 新規ファイルは fresh アクセントで浮き、既知ファイルの再 read は行が
-  上に浮くだけ（read 時刻降順ソート）
-- フォーカス喪失中に到着した新規 read は復帰時に fresh へ再シード
-  （アウェイ差分の read ビュー版）
-- mtime ビュー表示中はログを監視しない（従来どおり 2 秒リセキャンのみ）
-
-### フィルタ・その他
-
-- `/` / `--filter` は相対パスに既存どおり効く。`u`（未コミットのみ）も有効
-- `--files --view read`: TUI を開かず read されたファイルを read 時刻降順で
-  出力（`--format tsv` の時刻は read 時刻）
-- Enter / `o` / プレビューは mtime ビューと同一（選択パスを渡す）
-
-### 制限
-
-- ログ形式はエージェントの実装に依存する。未知のレコードは読み飛ばすが、
-  形式が変わると read が拾えなくなる（readlog の fixture テストが防ぐ）
-- セッションの途中経過も読むため、ログ末尾が書きかけ（JSON 不完全）でも
-  その行だけスキップして先へ進む
-- bash 参照は機械抽出のため誤検出があり得る（リダイレクト先・cp のコピー先
-  も「接触」として数える。拡張子なしファイルは `.` `/` ルールで落ちる）
-
----
-
 ## キーバインド
 
 ### ナビゲーション
@@ -357,7 +292,6 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 |---|---|
 | `/` | インクリメンタルフィルタ。ファイル名（パス含む）に対してマッチ。空文字で解除 |
 | `t` | ソート巡回: mtime↓ → mtime↑ → ctime↓ → ctime↑ |
-| `r` | ビュー切替: mtime ビュー ↔ read ビュー（read ビューはエージェントが Read したファイル一覧。フッタに `[read]` バッジ） |
 | `Ctrl+h` / `Backspace` | 隠しディレクトリ表示/非表示トグル（レガシー端末は Ctrl+h を BS 0x08 で送るため、Backspace も同一トグル） |
 | `d` | ディレクトリ表示/非表示トグル |
 | `\` | フィルタ適用の ON/OFF トグル（vim の `:nohlsearch` モデル。**テキストは保持**され、再トグルで即復帰。`/` で入力を始めると自動で ON に戻る） |
@@ -417,7 +351,6 @@ ashiato --files --format tsv | fzf --delimiter $'\t' --with-nth 2 --nth 2.. \
   --preview 'bat --color=always {3}'                 # ファイル名だけ表示（検索は名前+パス）
 ashiato --since today --filter .md                   # TUI: 今日の md をプレビュー付きでブラウズ
 ashiato --files --since today | fzf                  # 今日触ったファイルだけ
-ashiato --files --view read | fzf                    # エージェントが read したファイル（read 時刻順）
 ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまとめてレビュー
 ashiato --files | fzf --bind 'ctrl-r:reload(ashiato --files)'  # ライブ更新（手動）
 ```

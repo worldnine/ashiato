@@ -16,10 +16,3 @@ title = "ashiato: pick markdown files (side pane)"
 description = "Open the mtime-sorted markdown picker next to the agent pane"
 contexts = ["workspace", "tab", "pane"]
 command = ["bash", "scripts/ashiato-pane.sh"]
-
-[[actions]]
-id = "open-read"
-title = "ashiato: agent-read files, live (side pane)"
-description = "Open the read view (files the agent has Read, live-updating) next to the agent pane"
-contexts = ["workspace", "tab", "pane"]
-command = ["bash", "scripts/ashiato-pane.sh", "--view", "read"]

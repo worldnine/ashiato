@@ -1,29 +1,12 @@
 #!/bin/bash
-# ashiato herdr plugin action — 横分割で開くピッカー。
-# 既定: mtime 順 md ピッカー（ラベル ashiato）。
-# `--view read` 付き: read ビュー（ラベル ashiato-read、フィルタなし）—
-# エージェントが Read したファイルのライブビュー（Enter = akapen で「読んだ
-# ものをレビュー」）。
-# トグル: タブに同じラベルの ashiato pane があれば focus、なければ新規作成（増えない）。
+# ashiato herdr plugin action — prefix+m: md ピッカーを横分割で開く。
+# トグル: タブに ashiato pane があれば focus、なければ新規作成（増えない）。
 # 分割はタブのエージェント pane 基準（パレット経由の invoke では --current が
 # パレット overlay 自体を指すため、akp plugin と同じ対策）。
 # akapen の s 送信は --send-agent（タブ内唯一エージェントへ herdr 直送。
 # 曖昧/不在時はトースト拒否 + コメントはクリップボード）。
 # 時間カットオフ（--since）は付けない: 古い md も「Older」クラスタで拾えるように。
 set -euo pipefail
-
-# 引数: --view read で read ビュー（ラベル ashiato-read、フィルタなし）。
-VIEW="mtime"
-if [ "${1:-}" = "--view" ]; then
-  VIEW="${2:-mtime}"
-fi
-LABEL="ashiato"
-FILTER=".md"
-if [ "$VIEW" = "read" ]; then
-  # read ビューはエージェントが読んだもの全部（種類問わず）を見せる。
-  LABEL="ashiato-read"
-  FILTER=""
-fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ashiato は TUI をサスペンドして open-cmd を実行し、終了後にピッカーへ戻る）→ pane は閉じない。
@@ -52,8 +35,8 @@ AGENT_PANE=$(herdr agent list 2>/dev/null | jq -r --arg tab "$TAB" \
 SPLIT_TARGET=("--current")
 [ -n "$AGENT_PANE" ] && SPLIT_TARGET=("--pane" "$AGENT_PANE")
 
-EXISTING=$(herdr pane list | jq -r --arg tab "$TAB" --arg label "$LABEL" \
-  '.result.panes[] | select(.tab_id == $tab and .label == $label) | .pane_id' | head -1)
+EXISTING=$(herdr pane list | jq -r --arg tab "$TAB" \
+  '.result.panes[] | select(.tab_id == $tab and .label == "ashiato") | .pane_id' | head -1)
 if [ -n "$EXISTING" ]; then
   if [ -n "$AGENT_PANE" ]; then
     herdr pane focus --direction right --pane "$AGENT_PANE" 2>/dev/null || true
@@ -65,10 +48,7 @@ fi
 
 RESPONSE=$(herdr pane split "${SPLIT_TARGET[@]}" --direction right --focus)
 PANE_ID=$(printf '%s' "$RESPONSE" | jq -r '.result.pane.pane_id')
-herdr pane rename "$PANE_ID" "$LABEL"
+herdr pane rename "$PANE_ID" "ashiato"
 # ashiato が終了したら `;` の右で pane を閉じる（pane は使い捨て）。
 # 終了 = q / Ctrl+C のみ。Esc は akapen を抜けてピッカーへ戻るだけなので閉じない。
-CMD="ashiato --view $VIEW"
-[ -n "$FILTER" ] && CMD="$CMD --filter $FILTER"
-CMD="$CMD --open-cmd '$OPEN {}' --alt-open-cmd '$ALT_OPEN'"
-herdr pane run "$PANE_ID" "$CMD; herdr pane close $PANE_ID"
+herdr pane run "$PANE_ID" "ashiato --filter .md --open-cmd '$OPEN {}' --alt-open-cmd '$ALT_OPEN'; herdr pane close $PANE_ID"

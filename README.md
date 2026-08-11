@@ -43,7 +43,6 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `--files` | no TUI — print the time-sorted list to stdout (data source for fzf etc.) |
 | `--format <path\|tsv>` | output format for `--files` (`tsv` = `datetime<TAB>name<TAB>path`) |
 | `--since <today\|yesterday\|Nd\|Nw>` | time cutoff for `--files` and the TUI's initial view |
-| `--view <mtime\|read>` | initial view (`read` = files the agent has Read, live-updating; `r` toggles) |
 | `--output` | explicit alias of the default print-to-stdout behavior (mutually exclusive with `--open-cmd`) |
 
 `.gitignore` is respected (even outside git repos), plus a small always-ignore list (`.git/`, `node_modules/`, `target/`, `__pycache__/`, `.DS_Store`). Agent directories like `.claude/` are **not** excluded — agent-generated files are exactly what you want to review.
@@ -60,7 +59,6 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `/` | incremental filter (substring match on the relative path) |
 | `\` | toggle the filter off/on without erasing it (`:nohlsearch` model) |
 | `t` | cycle sort order |
-| `r` | toggle mtime view / read view (footer shows `[read]`) |
 | `Ctrl+h` | toggle hidden (dot-directories) |
 | `d` | toggle directories |
 | `u` | toggle: only files with uncommitted changes (git repos; dirty rows show `+N -M`) |
@@ -78,20 +76,6 @@ ashiato tracks terminal focus via xterm focus reporting (DECSET 1004; kitty, Wez
 - **When focus returns**, the display reverts to the normal listing instantly — no flash (the mtime sort already floated the changed files to the top).
 
 Changes are detected by `(mtime, size, is_dir)` — an edit that keeps all three (e.g. `touch -r` restoring the mtime after a same-size write) is not visible as a change; the preview cache has the same signature, so such edits can also leave a stale preview until the next real change.
-
-### Read view (files the agent Read)
-
-`r` toggles a second view: **the files your coding agent has read** (via its `Read` tool), parsed from the agent's own session logs — Claude Code (`~/.claude/projects/<slug>/<session>.jsonl`) and pi (`~/.pi/agent/sessions/<slug>/<session>.jsonl`). While mtime says *what the agent changed*, the read view shows *how it got there* — its exploration path.
-
-- Rows show the **last touch time** (same relative/HH:MM format; read and bash-mention both count as a touch, so files that were never `Read` still appear when the agent's commands pointed at them). No markers or count badges: they didn't discriminate anything.
-- The view is **live**: while it's on screen, the session logs are watched every 500ms (same `(mtime, size)` signature gate as the git integration); new files pop to the top with a fresh accent, known files re-read float up.
-- Files read but since deleted are dropped; the `/` filter and `u` (uncommitted) still work.
-- `--files --view read` prints the read list (read-time order) for fzf, `--format tsv` emits read times.
-
-```sh
-ashiato --view read .            # live view of what the agent is reading
-ashiato . --view read --open-cmd "akapen {} --send-agent"  # review what it read
-```
 
 ### Git integration
 
@@ -128,7 +112,6 @@ ashiato --files | fzf                                   # time-ordered × fuzzy 
 ashiato --files --format tsv | fzf --delimiter $'\t' \
   --with-nth 1..2 --preview 'bat --color=always {3}'    # time + name, full-path preview
 ashiato --files --since today | fzf                     # only today's files
-ashiato --files --view read | fzf                       # files the agent read (read-time order)
 ashiato --files --since 1w --filter .md | xargs akapen  # review this week's markdown
 ```
 
