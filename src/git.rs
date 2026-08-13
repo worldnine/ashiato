@@ -92,10 +92,13 @@ impl GitCache {
     /// rev-parse`). `None` when root is not inside a repo or git is
     /// missing — the caller keeps the feature dormant (P1).
     pub fn discover(root: &Path) -> Option<GitCache> {
+        // rev-parse 自体はロックを取らないが、git_output と同じ方針で
+        // 「ashiato の git は一切ロックを作らない」を不変条件にしておく。
         let out = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "--show-toplevel"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -184,11 +187,20 @@ impl GitCache {
 /// Run `git -C root <args>`; `None` on spawn failure or non-zero exit
 /// (callers treat both as "no data", e.g. `git diff HEAD` in a repo
 /// with an unborn HEAD).
+///
+/// `GIT_OPTIONAL_LOCKS=0`: `status` / `diff` は読み取りに見えて、stat が
+/// 古い index を opportunistic refresh で書き戻す（= `.git/index.lock` を
+/// 取る）。ashiato は 2 秒ごとの裏方ポーリングなので、その最中に kill
+/// されると 0 バイトの index.lock が残留し、同じチェックアウトの git を
+/// 全部止めてしまう（2026-08-13 に実害を確認）。この変数は git 2.15 で
+/// まさにバックグラウンドツール向けに入ったもので、refresh 書き戻しだけ
+/// をやめる — 出力は変わらず、ロックを一切作らなくなる。
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
