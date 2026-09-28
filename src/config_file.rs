@@ -10,7 +10,8 @@
 //! 優先は**フラグ > 設定ファイル > 既定**。層を重ねるのは
 //! `Config::parse_with_file`（`src/main.rs`）の仕事で、ここは読むだけ。
 //!
-//! 形は akapen の `src/config_file.rs` に揃えてある（キーは `[theme]` だけ）。
+//! キーは `[theme]` だけ。`[theme]` の表の型・値の扱い・置き場の解決は termtheme
+//! （`termtheme::config`）のもので、akapen と同じ。
 //!
 //! # 壊れたファイルは起動時のコマンドラインエラー
 //!
@@ -24,67 +25,29 @@
 //! - 空・空白だけの値は、書いていないのと同じ
 //! - `[theme]` の値が `~/` で始まれば展開する（`.tmTheme` のパス用）
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use termtheme::config::{ThemeSection, config_dir};
+use termtheme::theme::ThemePair;
 
-/// 設定ファイルの名前（[`user_dir`] の下）。
+/// 設定ファイルの名前（`termtheme::config::config_dir` の下）。
 const FILE_NAME: &str = "config.toml";
-
-/// ashiato の設定ディレクトリ: `$XDG_CONFIG_HOME/ashiato`、無ければ
-/// `~/.config/ashiato`。
-///
-/// 空の `XDG_CONFIG_HOME` は無いのと同じ。`HOME` も無ければ `None`
-/// （置き場が決まらない = 何も置いていない）。
-fn user_dir() -> Option<PathBuf> {
-    user_dir_with(|name| std::env::var_os(name))
-}
-
-/// [`user_dir`] の本体。環境変数 1 つを引く関数を受け取る（テストで注入する）。
-fn user_dir_with(env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let base = match env("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(env("HOME")?).join(".config"),
-    };
-    Some(base.join("ashiato"))
-}
 
 /// 読んだ設定ファイル。値は空・空白を落とし、`~/` を展開した後のもの。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfigFile {
-    /// `[theme] dark`（`--theme-dark` の下の層）。
-    pub theme_dark: Option<String>,
-    /// `[theme] light`（`--theme-light` の下の層）。
-    pub theme_light: Option<String>,
+    /// `[theme] dark` / `light`（`--theme-dark` / `--theme-light` の下の層）。
+    pub theme: ThemePair,
 }
 
-/// ファイルの形そのもの。**知らないキーは断る**（冒頭の doc）。
+/// ファイルの形そのもの。**知らないキーは断る**（冒頭の doc。`[theme]` の中の
+/// キーは `ThemeSection` が断る）。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    theme: Option<RawTheme>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTheme {
-    dark: Option<String>,
-    light: Option<String>,
-}
-
-/// 空・空白だけは書いていないのと同じ。
-fn non_blank(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.trim().is_empty())
-}
-
-/// `~/` で始まるなら `home` の下に展開する。`home` が無ければそのまま。
-fn expand_home(value: String, home: Option<&Path>) -> String {
-    match (value.strip_prefix("~/"), home) {
-        (Some(rest), Some(home)) => home.join(rest).to_string_lossy().into_owned(),
-        _ => value,
-    }
+    theme: Option<ThemeSection>,
 }
 
 impl ConfigFile {
@@ -92,10 +55,8 @@ impl ConfigFile {
     /// `home` は `~/` の展開に使う。
     pub fn parse(path: &Path, text: &str, home: Option<&Path>) -> Result<Self> {
         let raw: Raw = toml::from_str(text).with_context(|| path.display().to_string())?;
-        let theme = raw.theme.unwrap_or_default();
         Ok(Self {
-            theme_dark: non_blank(theme.dark).map(|v| expand_home(v, home)),
-            theme_light: non_blank(theme.light).map(|v| expand_home(v, home)),
+            theme: raw.theme.unwrap_or_default().into_pair(home),
         })
     }
 
@@ -110,10 +71,13 @@ impl ConfigFile {
         Self::parse(path, &text, home).map(Some)
     }
 
-    /// 置き場（[`user_dir`]）のファイルを読む。**実環境と実ファイルを読むのは
-    /// ここだけ**（`Config::from_env` から呼ぶ）。
+    /// 置き場（`$XDG_CONFIG_HOME/ashiato`、無ければ `~/.config/ashiato`）の
+    /// ファイルを読む。**実環境と実ファイルを読むのはここだけ**
+    /// （`Config::from_env` から呼ぶ）。
     pub fn discover() -> Result<Option<Self>> {
-        let Some(path) = user_dir().map(|dir| dir.join(FILE_NAME)) else {
+        let Some(path) =
+            config_dir("ashiato", |name| std::env::var_os(name)).map(|dir| dir.join(FILE_NAME))
+        else {
             return Ok(None);
         };
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -142,32 +106,6 @@ mod tests {
     }
 
     #[test]
-    fn the_directory_is_xdg_config_home_else_dot_config_under_home() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                pairs
-                    .iter()
-                    .find(|(k, _)| *k == name)
-                    .map(|(_, v)| OsString::from(v))
-            }
-        };
-        assert_eq!(
-            user_dir_with(env(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/home/u")])),
-            Some(PathBuf::from("/xdg/ashiato"))
-        );
-        // 空の XDG_CONFIG_HOME は無いのと同じ。
-        assert_eq!(
-            user_dir_with(env(&[("XDG_CONFIG_HOME", ""), ("HOME", "/home/u")])),
-            Some(PathBuf::from("/home/u/.config/ashiato"))
-        );
-        assert_eq!(
-            user_dir_with(env(&[("HOME", "/home/u")])),
-            Some(PathBuf::from("/home/u/.config/ashiato"))
-        );
-        assert_eq!(user_dir_with(env(&[])), None, "置き場が決まらない");
-    }
-
-    #[test]
     fn an_empty_file_sets_nothing() {
         let file = parse("").unwrap();
         assert_eq!(file, ConfigFile::default());
@@ -185,12 +123,12 @@ light = "Catppuccin Latte"
 "#,
         )
         .unwrap();
-        assert_eq!(file.theme_dark.as_deref(), Some("Catppuccin Mocha"));
-        assert_eq!(file.theme_light.as_deref(), Some("Catppuccin Latte"));
+        assert_eq!(file.theme.dark.as_deref(), Some("Catppuccin Mocha"));
+        assert_eq!(file.theme.light.as_deref(), Some("Catppuccin Latte"));
         // 片側だけでもよい。
         let file = parse("[theme]\nlight = \"Catppuccin Latte\"\n").unwrap();
-        assert_eq!(file.theme_dark, None);
-        assert_eq!(file.theme_light.as_deref(), Some("Catppuccin Latte"));
+        assert_eq!(file.theme.dark, None);
+        assert_eq!(file.theme.light.as_deref(), Some("Catppuccin Latte"));
     }
 
     #[test]
@@ -202,16 +140,16 @@ light = "Catppuccin Latte"
         ))
         .unwrap();
         assert_eq!(
-            file.theme_dark.as_deref(),
+            file.theme.dark.as_deref(),
             Some("/home/u/themes/night.tmTheme")
         );
-        assert_eq!(file.theme_light.as_deref(), Some("Solarized (light)"));
+        assert_eq!(file.theme.light.as_deref(), Some("Solarized (light)"));
         // `~` 単独や `~user/` は展開しない（`~/` だけ）。HOME が無ければそのまま。
         let file = parse("[theme]\ndark = \"~other/x.tmTheme\"\n").unwrap();
-        assert_eq!(file.theme_dark.as_deref(), Some("~other/x.tmTheme"));
+        assert_eq!(file.theme.dark.as_deref(), Some("~other/x.tmTheme"));
         let file = ConfigFile::parse(Path::new("c.toml"), "[theme]\ndark = \"~/x.tmTheme\"", None)
             .unwrap();
-        assert_eq!(file.theme_dark.as_deref(), Some("~/x.tmTheme"));
+        assert_eq!(file.theme.dark.as_deref(), Some("~/x.tmTheme"));
     }
 
     #[test]
@@ -265,8 +203,8 @@ light = "Catppuccin Latte"
 
         std::fs::write(&path, "[theme]\ndark = \"~/night.tmTheme\"\n").unwrap();
         let file = ConfigFile::load(&path, Some(home)).unwrap().unwrap();
-        assert_eq!(file.theme_dark.as_deref(), Some("/home/u/night.tmTheme"));
-        assert_eq!(file.theme_light, None);
+        assert_eq!(file.theme.dark.as_deref(), Some("/home/u/night.tmTheme"));
+        assert_eq!(file.theme.light, None);
 
         // 壊れた中身は、実ファイルのパスを添えたエラー。
         std::fs::write(&path, "[theme]\ndrak = \"x\"\n").unwrap();

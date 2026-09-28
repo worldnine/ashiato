@@ -41,7 +41,7 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `--theme <name>` | syntect theme (two-face name or `.tmTheme` path) used on both light and dark backgrounds; beats `--theme-dark` / `--theme-light` |
 | `--theme-dark <name>` | syntect theme on a dark background (default `Catppuccin Mocha`) |
 | `--theme-light <name>` | syntect theme on a light background (default `Solarized (light)`) |
-| `--light` / `--dark` | force the palette, and with it which of the two themes applies (default: auto-detect via OSC 11) |
+| `--light` / `--dark` | force the palette, and with it which of the two themes applies (default: auto-detect via OSC 11 at startup, then follow the terminal's light/dark switches while open; a forced palette ignores them) |
 | `--files` | no TUI — print the time-sorted list to stdout (data source for fzf etc.) |
 | `--format <path\|tsv>` | output format for `--files` (`tsv` = `datetime<TAB>name<TAB>path`) |
 | `--since <today\|yesterday\|Nd\|Nw>` | time cutoff for `--files` and the TUI's initial view |
@@ -64,7 +64,7 @@ light = "Catppuccin Latte"
 | `[theme] dark` | `--theme-dark` | `--theme` > `--theme-dark` > file > `Catppuccin Mocha` |
 | `[theme] light` | `--theme-light` | `--theme` > `--theme-light` > file > `Solarized (light)` |
 
-- Which side applies follows the light/dark decision (`--light` / `--dark`, else OSC 11). A name that doesn't resolve falls back to that side's default.
+- Which side applies follows the light/dark decision (`--light` / `--dark`, else OSC 11 at startup and the terminal's switches while open). A name that doesn't resolve falls back to that side's default.
 - Values starting with `~/` are expanded (for `.tmTheme` paths). Empty or blank values count as not written.
 - Unknown keys, wrong types and broken TOML stop ashiato at startup, naming the file — a typo is never silently ignored. The flip side: a config that uses a key this build doesn't know (written for a newer ashiato) stops an older one. `--help` and `--version` never read the file.
 
@@ -147,14 +147,15 @@ The repo is also a [herdr plugin](herdr-plugin.toml): `herdr plugin link <this r
 - Rust + [ratatui](https://ratatui.rs) 0.30; file collection via the `ignore` crate.
 - Preview reads at most the first 256 KB; binaries show `file(1)`-style info instead of crashing.
 - Speed-first preview: while you hold j/k (key repeat) the pane shows a placeholder so each cursor move costs only the list draw; the real preview catches up ~40 ms after you release the key.
-- Light/dark auto-detection queries the terminal background with OSC 11 (falls back to dark).
+- Light/dark auto-detection queries the terminal background with OSC 11 (falls back to dark). While open, ashiato subscribes to the terminal's color-scheme notifications (mode 2031) and swaps the syntax theme, the UI colors and the preview when the terminal switches (e.g. the macOS appearance flips). Terminals without mode 2031 just keep the startup decision. The subscription is dropped before a child command (akapen, …) gets the terminal and on exit, and renewed on return.
+- The light/dark plumbing — OSC 11, mode 2031, the input reader that can receive its notifications (crossterm 0.29 can't), theme resolution and the `[theme]` table — comes from [termtheme](https://github.com/worldnine/termtheme).
 - Deliberately not: tree views, preview scrolling, fuzzy matching, alphabetical sort, icon fonts. See [docs/spec.md](docs/spec.md).
 
 ## License & credits
 
 MIT License.
 
-`src/highlight.rs` is a copy of [akapen](https://github.com/worldnine/akapen)'s highlighter, which in turn adapts [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) (MIT, Dmitry Persiyanov).
+`src/highlight.rs` is a copy of [akapen](https://github.com/worldnine/akapen)'s highlighter (its theme part now lives in termtheme), which in turn adapts [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr) (MIT, Dmitry Persiyanov).
 
 ## Git integration demo
 

@@ -37,7 +37,7 @@ ashiato [directory] [flags]
 | `--theme <name>` | — | プレビューの syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス）。light/dark の両側を上書きし、`--theme-dark` / `--theme-light` より強い |
 | `--theme-dark <name>` | `Catppuccin Mocha` | 背景が dark のときのテーマ |
 | `--theme-light <name>` | `Solarized (light)` | 背景が light のときのテーマ |
-| `--light` / `--dark` | 自動検出 | light/dark の明示指定。OSC 11 でターミナル背景色を問い合わせ、輝度 128 超で light。応答なしは dark |
+| `--light` / `--dark` | 自動検出 | light/dark の明示指定。既定は起動時に OSC 11 でターミナル背景色を問い合わせ、輝度 128 超で light。応答なしは dark。開いている間はターミナルの切り替え（モード 2031）に追従する。明示指定したときは追従しない |
 
 > 未知のフラグ・値のないフラグ・不正な値（`--sort bogus`、`--since bogus` 等）は
 > **エラーで即終了**する。黙って無視すると typo が「効いたように見える」ため
@@ -203,6 +203,20 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 - light/dark は**自動判定**: 起動時 OSC 11（`ESC ] 11 ; ?`）でターミナル背景色を
   問い合わせ、輝度が 128 を超えれば light。応答しないターミナル（Terminal.app 等）は
   dark。`--light` / `--dark` で明示指定が最優先
+- 開いている間は**切り替えに追従**: モード 2031（`CSI ? 2031 h`）でターミナルの配色の
+  知らせを購読し、`CSI ? 997 ; 1 n`（dark）/ `CSI ? 997 ; 2 n`（light）が届いたら
+  light/dark を決め直して、light から導いているもの — 構文のテーマ（その側）・
+  TUI 色・描画済みのプレビュー — を作り直して描き直す。締め切りに遅れて届いた
+  OSC 11 の答えも同じに扱う。`--light` / `--dark` で固定したときは知らせを無視する
+  （`--theme` で両側が同じテーマでも、TUI 色は追従する）。2031 を知らない
+  ターミナルでは何も変わらない（知らせが来ないだけ）
+- 購読は端末の状態で、プロセスが終わっても残る。端末を手放すとき — 終わるとき・
+  panic・SIGINT/SIGTERM・`--open-cmd` / `--alt-open-cmd` の子に渡すとき・Ctrl+Z —
+  は必ず外す（子の akapen は自分で購読する。外さずに渡すと crossterm で読む子は
+  知らせで止まる）。戻ったら張り直し、離れている間の変化を拾うため今の配色を
+  問い合わせる（`CSI ? 996 n`）
+- 入力は termtheme の読み手で読む。crossterm 0.29 の `event::poll` / `event::read` は
+  知らせを受けると後ろの入力を飲み込み、poll ごと止まるため、1 か所も使わない
 - 判定の結果に合う側を使う。各側は `--theme-dark` / `--theme-light` > 設定ファイル
   （`$XDG_CONFIG_HOME/ashiato/config.toml`、無ければ `~/.config/ashiato/config.toml`
   の `[theme] dark` / `light`）> 既定（dark `Catppuccin Mocha` / light
@@ -505,8 +519,9 @@ ashiato . --open-cmd "vim -p {}"
 src/main.rs      — エントリ、フラグ解析、App 状態、イベントループ、描画、キーバインド
 src/files.rs     — ignore クレートでの収集、ソート、時間クラスタ、フィルタ
 src/preview.rs   — 右ペイン: syntect ハイライト / バイナリは file(1) 的表示
-src/theme.rs     — OSC 11 背景色検出 + light/dark UI 色（akapen と同一定数）
-src/highlight.rs — akapen の highlight.rs の手動コピー
+src/theme.rs     — light/dark UI 色（akapen と同一定数）
+src/highlight.rs — akapen の highlight.rs の手動コピー（テーマの部分は termtheme）
+src/config_file.rs — 設定ファイル（`[theme]` の型は termtheme）
 src/herdr.rs     — herdr ディレクトリ解決（JSON パース）
 src/clipboard.rs — pbcopy / wl-copy / xclip / xsel
 ```
@@ -516,6 +531,11 @@ src/clipboard.rs — pbcopy / wl-copy / xclip / xsel
 `src/highlight.rs` は akapen からの**手動コピー**。ズレても「プレビューの色が
 少し違う」だけで壊れないため許容する。このコピーへの変更要求が3回目になったら、
 そのとき highlight だけを小さな共通クレートへ切り出す（YAGNI。それまではやらない）。
+
+テーマの部分（名前・`.tmTheme` の解決、側ごとの既定、Markdown の scope の読み替え、
+既定の文字色）と、背景色の判定（OSC 11）・モード 2031・入力の読み手・`[theme]` の
+表・設定ディレクトリの解決は、akapen と写し合っていたものを共通クレート
+[termtheme](https://github.com/worldnine/termtheme) へ切り出した。
 
 ### ファイル収集
 
@@ -568,7 +588,7 @@ builder.filter_entry(|e| {
 13. `.claude/`、`.codex/` が除外されていない
 14. 画像/バイナリファイルでプレビューがクラッシュしない
 15. herdr 外でも `herdr` コマンド不在でクラッシュせず起動する
-16. OSC 11 応答のパース（`rgb:rrrr/gggg/bbbb` / 短形式 / `rgba:` / `#rrggbb`）が正しい
+16. 配色の知らせ（light / dark）で構文のテーマ・TUI 色・プレビューが作り直され、`--light` / `--dark` の固定では変わらない（OSC 11 の応答のパースは termtheme が確かめる）
 17. `--light` / `--dark` がパースされ、既定が自動検出（None）になる
 18. light/dark の UI 色が akapen と同一の定数で解決される
 19. 行レイアウトの短縮: ベース名が最優先（ディレクトリ → `…/` 短縮 → ベース名 `…` 短縮）、文字境界安全
