@@ -91,13 +91,13 @@ ashiato は xterm フォーカスレポート（DECSET 1004）でターミナル
 `--open-cmd` を指定すると、`Enter` が選択ファイルでレビュアーを起動し、終了までブロックして再スキャンします。編集されたばかりのファイルが再び上に来て、次のラウンドへ:
 
 ```sh
-ashiato . --open-cmd "akapen {} --send-agent"
+ashiato . --open-cmd "akapen {} --send-agent --ime jp"
 ```
 
 `--alt-open-cmd` を併用すると `o` キーで別のコマンドも同じフローで起動できます — 直行のレビューループ（Enter = akapen）を保ちつつ、ファイラへも飛べます:
 
 ```sh
-ashiato . --open-cmd "akapen {} --send-agent" --alt-open-cmd "yazi {}"
+ashiato . --open-cmd "akapen {} --send-agent --ime jp" --alt-open-cmd "yazi {}"
 # Enter = akapen でレビュー → 再スキャン、o = yazi で開く（q で抜けると再スキャン）
 ```
 

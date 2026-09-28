@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ashiato は TUI をサスペンドして open-cmd を実行し、終了後にピッカーへ戻る）→ pane は閉じない。
 # Esc で抜けるため akapen 側に --esc-quit always を渡す。
 # ashiato を終了（q / Ctrl+C）したら、使い捨ての pane ごと閉じる。
-OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent --esc-quit always}"
+OPEN="${ASHIATO_OPEN_CMD:-akapen --send-agent --esc-quit always --ime jp}"
 # o キー（--alt-open-cmd）: 選択ファイルを yazi で開く。q で抜けるとピッカーへ戻る。
 # ASHIATO_ALT_OPEN_CMD で差し替え可能（例: "code {}"）。
 ALT_OPEN="${ASHIATO_ALT_OPEN_CMD:-yazi {}}"
