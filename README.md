@@ -38,14 +38,35 @@ By default, `Enter` prints the selected paths to stdout and exits (the fzf model
 | `--alt-open-cmd <cmd>` | command `o` launches with the selection (same `{}` / `{1}`… placeholders; blocks then rescans). Without it, `o` is a dead key |
 | `--filter <text>` | initial filter (same matching as `/`; e.g. `--filter .md`) |
 | `--preview <on\|off\|auto>` | preview pane; `auto` (default) hides it under 80 columns |
-| `--theme <name>` | syntect theme (two-face name or `.tmTheme` path; default `Catppuccin Mocha`, `Solarized (light)` when light is detected) |
-| `--light` / `--dark` | force the palette (default: auto-detect via OSC 11) |
+| `--theme <name>` | syntect theme (two-face name or `.tmTheme` path) used on both light and dark backgrounds; beats `--theme-dark` / `--theme-light` |
+| `--theme-dark <name>` | syntect theme on a dark background (default `Catppuccin Mocha`) |
+| `--theme-light <name>` | syntect theme on a light background (default `Solarized (light)`) |
+| `--light` / `--dark` | force the palette, and with it which of the two themes applies (default: auto-detect via OSC 11) |
 | `--files` | no TUI — print the time-sorted list to stdout (data source for fzf etc.) |
 | `--format <path\|tsv>` | output format for `--files` (`tsv` = `datetime<TAB>name<TAB>path`) |
 | `--since <today\|yesterday\|Nd\|Nw>` | time cutoff for `--files` and the TUI's initial view |
 | `--output` | explicit alias of the default print-to-stdout behavior (mutually exclusive with `--open-cmd`) |
 
 `.gitignore` is respected (even outside git repos), plus a small always-ignore list (`.git/`, `node_modules/`, `target/`, `__pycache__/`, `.DS_Store`). Agent directories like `.claude/` are **not** excluded — agent-generated files are exactly what you want to review.
+
+### Config file
+
+`$XDG_CONFIG_HOME/ashiato/config.toml` (else `~/.config/ashiato/config.toml`). Every key is optional; without the file ashiato behaves exactly as before.
+
+```toml
+[theme]
+dark  = "Catppuccin Mocha"     # two-face theme name or path to a .tmTheme file
+light = "Catppuccin Latte"
+```
+
+| Key | Same as | Precedence (first wins) |
+|---|---|---|
+| `[theme] dark` | `--theme-dark` | `--theme` > `--theme-dark` > file > `Catppuccin Mocha` |
+| `[theme] light` | `--theme-light` | `--theme` > `--theme-light` > file > `Solarized (light)` |
+
+- Which side applies follows the light/dark decision (`--light` / `--dark`, else OSC 11). A name that doesn't resolve falls back to that side's default.
+- Values starting with `~/` are expanded (for `.tmTheme` paths). Empty or blank values count as not written.
+- Unknown keys, wrong types and broken TOML stop ashiato at startup, naming the file — a typo is never silently ignored. The flip side: a config that uses a key this build doesn't know (written for a newer ashiato) stops an older one. `--help` and `--version` never read the file.
 
 ## Keys
 

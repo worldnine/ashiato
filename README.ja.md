@@ -38,14 +38,35 @@ ashiato [directory] [flags]
 | `--alt-open-cmd <cmd>` | `o` キーで起動するコマンド（`--open-cmd` と同じ `{}` / `{1}`.. プレースホルダ・ブロック → 再スキャン。未指定時は `o` は無効） |
 | `--filter <text>` | 初期フィルタ（`/` と同じマッチング。例: `--filter .md`） |
 | `--preview <on\|off\|auto>` | プレビューペイン。`auto`（既定）は 80 列未満で非表示 |
-| `--theme <name>` | syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス。既定 `Catppuccin Mocha`、light 検出時 `Solarized (light)`） |
-| `--light` / `--dark` | light/dark の明示指定（既定: OSC 11 で自動検出） |
+| `--theme <name>` | syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス）。light/dark のどちらの背景でもこれを使い、`--theme-dark` / `--theme-light` より強い |
+| `--theme-dark <name>` | 背景が dark のときの syntect テーマ（既定 `Catppuccin Mocha`） |
+| `--theme-light <name>` | 背景が light のときの syntect テーマ（既定 `Solarized (light)`） |
+| `--light` / `--dark` | light/dark の明示指定。2 本のテーマのどちらを使うかもこれで決まる（既定: OSC 11 で自動検出） |
 | `--files` | TUI なしで時間順パス一覧を出力（fzf 等へのデータソース） |
 | `--format <path\|tsv>` | `--files` の出力形式（tsv = `日時<TAB>名前<TAB>パス`） |
 | `--since <today\|yesterday\|Nd\|Nw>` | 時間カットオフ（`--files` の絞り込み + TUI の初期表示） |
 | `--output` | 既定動作（stdout 出力）の明示指定。`--open-cmd` と排他 |
 
 `.gitignore` を尊重し（git リポジトリ外でも有効）、常時除外リスト（`.git/`、`node_modules/`、`target/`、`__pycache__/`、`.DS_Store`）を併用します。`.claude/` などのエージェント関連ディレクトリは**除外しません** — エージェントが生成したファイルこそレビュー対象だからです。
+
+### 設定ファイル
+
+`$XDG_CONFIG_HOME/ashiato/config.toml`（無ければ `~/.config/ashiato/config.toml`）。どのキーも省略でき、ファイルが無ければ今までと完全に同じ動作です。
+
+```toml
+[theme]
+dark  = "Catppuccin Mocha"     # two-face の名前か .tmTheme のパス
+light = "Catppuccin Latte"
+```
+
+| キー | 対応するフラグ | 優先（左が勝つ） |
+|---|---|---|
+| `[theme] dark` | `--theme-dark` | `--theme` > `--theme-dark` > 設定ファイル > `Catppuccin Mocha` |
+| `[theme] light` | `--theme-light` | `--theme` > `--theme-light` > 設定ファイル > `Solarized (light)` |
+
+- どちらの側を使うかは light/dark の判定（`--light` / `--dark`、無ければ OSC 11）に従います。名前が解決できない場合は、その側の既定へフォールバック。
+- 値が `~/` で始まれば展開します（`.tmTheme` のパス用）。空・空白だけの値は、書いていないのと同じです。
+- 知らないキー・型違い・壊れた TOML は、ファイルのパスを添えて起動時に止まります（タイプミスを黙って無視しない）。代わりに、新しい ashiato 向けに書いた設定（この版が知らないキー入り）を古い ashiato が読むと起動しません。`--help` と `--version` は設定ファイルを読みません。
 
 ## キー
 

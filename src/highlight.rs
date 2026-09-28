@@ -20,8 +20,14 @@ use syntect::parsing::{Scope, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 use two_face::theme::EmbeddedLazyThemeSet;
 
-/// Default syntax theme when `--theme` is absent or unknown.
+/// Default syntax theme when the dark side has no theme (`--theme` /
+/// `--theme-dark` / the config file's `[theme] dark`, see `SyntaxThemes`
+/// in main.rs) or it is unknown (dark mode).
 pub const DEFAULT_THEME: &str = "Catppuccin Mocha";
+/// The light-mode counterpart (`--theme-light` / `[theme] light`) — a
+/// light background must never fall back to a dark theme's pale
+/// foreground colors.
+pub const DEFAULT_THEME_LIGHT: &str = "Solarized (light)";
 
 /// Markdown scope aliases: syntect's/two-face's markdown grammars emit
 /// scopes like `markup.raw.code-fence.rust.markdown-gfm` and
@@ -154,8 +160,9 @@ pub fn syntax_for(path: &std::path::Path) -> &'static SyntaxReference {
 impl Highlighter {
     /// Build from a theme: an embedded two-face theme name, or a path to a
     /// `.tmTheme` file (e.g. a tokyo-night.tmTheme downloaded from a theme
-    /// repo). Unknown names and unreadable files fall back to
-    /// [`DEFAULT_THEME`]. The default grammar is markdown ([`highlight`]);
+    /// repo). Absent or unknown names and unreadable files fall back to
+    /// [`DEFAULT_THEME`], or [`DEFAULT_THEME_LIGHT`] when `light`. The
+    /// default grammar is markdown ([`highlight`]);
     /// source mode passes per-file grammars via [`Self::highlight_with`].
     pub fn new(theme_name: Option<&str>, light: bool) -> Self {
         let mut theme = theme_name
@@ -167,7 +174,14 @@ impl Highlighter {
                     theme_by_name(name)
                 }
             })
-            .unwrap_or_else(|| theme_by_name(DEFAULT_THEME).expect("default theme is embedded"));
+            .unwrap_or_else(|| {
+                let name = if light {
+                    DEFAULT_THEME_LIGHT
+                } else {
+                    DEFAULT_THEME
+                };
+                theme_by_name(name).expect("default themes are embedded")
+            });
         // Fold legacy markdown scope names in so third-party themes still
         // color fenced/inline code (the newer grammars emit newer names).
         apply_markdown_scope_aliases(&mut theme);
@@ -456,7 +470,7 @@ fn expand_tabs(s: &str, col: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_THEME, Highlighter, Span, syntax_for, wrap_spans};
+    use super::{DEFAULT_THEME, DEFAULT_THEME_LIGHT, Highlighter, Span, syntax_for, wrap_spans};
     use std::path::Path;
     use ratatui::style::{Color, Style};
     use unicode_width::UnicodeWidthStr;
@@ -475,6 +489,19 @@ mod tests {
         assert!(!lines[0].is_empty());
         let joined: String = lines[2].iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "**bold**");
+    }
+
+    #[test]
+    fn absent_or_unknown_themes_fall_back_to_the_default_for_the_background() {
+        // A light background never falls back to a dark theme's pale
+        // foreground (and vice versa).
+        let dark = Highlighter::new(Some(DEFAULT_THEME), false).default_fg();
+        let light = Highlighter::new(Some(DEFAULT_THEME_LIGHT), true).default_fg();
+        assert_ne!(dark, light);
+        for name in [None, Some("no-such-theme"), Some("/no/such.tmTheme")] {
+            assert_eq!(Highlighter::new(name, false).default_fg(), dark, "{name:?}");
+            assert_eq!(Highlighter::new(name, true).default_fg(), light, "{name:?}");
+        }
     }
 
     #[test]
