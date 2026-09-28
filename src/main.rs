@@ -34,6 +34,7 @@
 //! can later move into the akapen repo as `src/bin/ashiato.rs`.
 
 mod clipboard;
+mod config_file;
 mod files;
 mod git;
 mod herdr;
@@ -65,15 +66,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
+use crate::config_file::ConfigFile;
 use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, is_fresh, to_local};
 use crate::highlight::Highlighter;
 use crate::preview::{Preview, PreviewKey};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Light-mode default syntax theme (used when light was auto-detected and
-/// no `--theme` was given; the dark default lives in highlight.rs as
-/// `DEFAULT_THEME`).
-const DEFAULT_THEME_LIGHT: &str = "Solarized (light)";
 /// Event poll/tick cadence, ms.
 const TICK_MS: u64 = 100;
 /// Input events closer together than this are a "burst" (held j/k repeat,
@@ -122,14 +120,43 @@ struct Config {
     since: Option<Since>,
     /// `--output`: Enter prints the selected paths to stdout and exits.
     output: bool,
-    /// `--theme <name>`: syntect theme name or path to a `.tmTheme`
-    /// file (default: highlight.rs's `DEFAULT_THEME`; `Solarized (light)`
-    /// when the light mode was auto-detected and no theme was given).
-    theme: Option<String>,
+    /// シンタックスハイライトのテーマ。背景が dark のときと light のときの
+    /// 2 本で、どちらを使うかは起動時の判定（`--light` / `--dark` か OSC 11）が
+    /// 決める（[`SyntaxThemes::for_background`]）。
+    ///
+    /// 各側は `--theme-dark` / `--theme-light` > 設定ファイルの `[theme]` >
+    /// 既定。`--theme <name>` は**両側を上書きする**（どちらでもそれを使う。
+    /// 1 本だったころの意味のまま）。値は syntect のテーマ名か `.tmTheme` の
+    /// パス。
+    theme: SyntaxThemes,
     /// `--light` / `--dark`: force the TUI's light/dark mode.
     /// `None` (the default) = auto-detect the terminal background via
     /// OSC 11, falling back to dark when the terminal doesn't answer.
     light: Option<bool>,
+}
+
+/// 背景ごとのシンタックスハイライトのテーマ（[`Config::theme`]）。
+///
+/// `None` は既定 —— [`Highlighter::new`] が light/dark に合ったもの
+/// （`Catppuccin Mocha` / `Solarized (light)`）を選ぶ。名前が解決できない
+/// ときも同じ既定へ落ちる。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SyntaxThemes {
+    /// 背景が dark のとき。
+    dark: Option<String>,
+    /// 背景が light のとき。
+    light: Option<String>,
+}
+
+impl SyntaxThemes {
+    /// 背景に合う側。
+    fn for_background(&self, light: bool) -> Option<&str> {
+        if light {
+            self.light.as_deref()
+        } else {
+            self.dark.as_deref()
+        }
+    }
 }
 
 /// What the process should do, resolved from argv.
@@ -268,7 +295,23 @@ fn flag_value<I: Iterator<Item = String>>(it: &mut I, flag: &str) -> Result<Stri
 }
 
 impl Config {
+    /// 引数だけで解釈する（**設定ファイルは無いものとする**）。テスト用。
+    #[cfg(test)]
     fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Action> {
+        Self::parse_with_file(args, || Ok(None))
+    }
+
+    /// 引数と設定ファイルで解釈する。`config_file` は設定ファイルを読む関数で、
+    /// **実ファイルを読むのは [`Config::from_env`] だけ**（テストは中身を注入する）。
+    ///
+    /// `config_file` は**短絡（`--help` / `--version`）とフラグの誤りの後で**
+    /// 呼ぶ。壊れた設定ファイルは起動時のエラーだが、それで `--help` まで
+    /// 読めなくなると直し方を調べる道が無い。
+    fn parse_with_file<I, C>(args: I, config_file: C) -> Result<Action>
+    where
+        I: IntoIterator<Item = String>,
+        C: FnOnce() -> Result<Option<ConfigFile>>,
+    {
         let mut dir: Option<PathBuf> = None;
         let mut sort = Sort::MtimeDesc;
         let mut show_hidden = false;
@@ -282,6 +325,8 @@ impl Config {
         let mut since: Option<Since> = None;
         let mut output = false;
         let mut theme: Option<String> = None;
+        let mut theme_dark: Option<String> = None;
+        let mut theme_light: Option<String> = None;
         let mut light: Option<bool> = None;
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
@@ -292,6 +337,8 @@ impl Config {
                 "--show-dirs" => show_dirs = true,
                 "--output" => output = true,
                 "--theme" => theme = Some(flag_value(&mut it, "--theme")?),
+                "--theme-dark" => theme_dark = Some(flag_value(&mut it, "--theme-dark")?),
+                "--theme-light" => theme_light = Some(flag_value(&mut it, "--theme-light")?),
                 "--light" => light = Some(true),
                 "--dark" => light = Some(false),
                 "--sort" => {
@@ -343,6 +390,20 @@ impl Config {
         if output && alt_open_cmd.is_some() {
             bail!("--output and --alt-open-cmd are mutually exclusive");
         }
+        let file = config_file()?;
+        let file = file.as_ref();
+        // テーマ。`--theme` は両側を上書きする（1 本だったころの意味のまま、
+        // `--theme-dark` / `--theme-light` より強い）。各側はフラグ > 設定
+        // ファイル > 既定（`None`、[`Highlighter::new`]）。
+        let theme = SyntaxThemes {
+            dark: theme
+                .clone()
+                .or(theme_dark)
+                .or_else(|| file.and_then(|f| f.theme_dark.clone())),
+            light: theme
+                .or(theme_light)
+                .or_else(|| file.and_then(|f| f.theme_light.clone())),
+        };
         Ok(Action::Run(Config {
             dir,
             sort,
@@ -362,7 +423,7 @@ impl Config {
     }
 
     fn from_env() -> Result<Action> {
-        Self::parse(std::env::args().skip(1))
+        Self::parse_with_file(std::env::args().skip(1), ConfigFile::discover)
     }
 }
 
@@ -402,8 +463,14 @@ fn main() -> Result<()> {
                  \x20 --preview <on|off|auto>  preview pane (default auto:\n\
                  \x20                   hidden below 80 columns)\n\
                  \x20 --theme <name>    syntect theme name or path to a\n\
-                 \x20                   .tmTheme file (default: Catppuccin\n\
-                 \x20                   Mocha; Solarized (light) in light mode)\n\
+                 \x20                   .tmTheme file, used on both light and\n\
+                 \x20                   dark backgrounds (beats --theme-dark /\n\
+                 \x20                   --theme-light)\n\
+                 \x20 --theme-dark <name>  the theme on a dark background\n\
+                 \x20                   (default Catppuccin Mocha)\n\
+                 \x20 --theme-light <name> the theme on a light background\n\
+                 \x20                   (default Solarized (light)). Which side\n\
+                 \x20                   applies follows --light/--dark or OSC 11\n\
                  \x20 --light           force light mode (default: auto-detect\n\
                  \x20                   the terminal background via OSC 11)\n\
                  \x20 --dark            force dark mode\n\
@@ -412,6 +479,12 @@ fn main() -> Result<()> {
                  \x20 --since <today|yesterday|Nd|Nw>  --files cutoff\n\
                  \x20 --output       explicit output mode (same as the default;\n\
                  \x20                   exclusive with --open-cmd)\n\
+                 \n\
+                 config file: $XDG_CONFIG_HOME/ashiato/config.toml (else\n\
+                 \x20 ~/.config/ashiato/config.toml), every key optional:\n\
+                 \x20 [theme] dark / light (same values as --theme-dark /\n\
+                 \x20 --theme-light). flags > config file > defaults. Unknown\n\
+                 \x20 keys, wrong types and broken TOML stop at startup\n\
                  \n\
                  keys:\n\
                  \x20 j/k/arrows     move   g/G  top/bottom\n\
@@ -1269,15 +1342,11 @@ fn run(config: Config) -> Result<()> {
     let light = config
         .light
         .unwrap_or_else(|| theme::detect_light().unwrap_or(false));
-    // The syntax theme: --theme wins; otherwise the light mode picks a
-    // light-readable default (the dark default is highlight.rs's).
-    let highlight = Highlighter::new(
-        config
-            .theme
-            .as_deref()
-            .or_else(|| light.then_some(DEFAULT_THEME_LIGHT)),
-        light,
-    );
+    // The syntax theme: the side matching light/dark (--theme covers both,
+    // else --theme-dark / --theme-light, else the config file's [theme]);
+    // a missing or unresolvable name falls back to that side's default
+    // (Highlighter::new).
+    let highlight = Highlighter::new(config.theme.for_background(light), light);
     let mut app = App {
         config,
         root: root.clone(),
@@ -2516,7 +2585,7 @@ mod tests {
     #[test]
     fn theme_and_light_flags_parse() {
         let c = run_config(&["--theme", "Nord"]);
-        assert_eq!(c.theme.as_deref(), Some("Nord"));
+        assert_eq!(c.theme, both_themes("Nord"));
         assert_eq!(c.light, None); // default: auto-detect
         assert_eq!(run_config(&["--light"]).light, Some(true));
         assert_eq!(run_config(&["--dark"]).light, Some(false));
@@ -2525,6 +2594,133 @@ mod tests {
         // A bare --theme with no value is an error (a silently dropped
         // flag looks like it worked).
         assert!(Config::parse(["--theme".to_string()]).is_err());
+        assert!(Config::parse(["--theme-dark".to_string()]).is_err());
+        assert!(Config::parse(["--theme-light".to_string()]).is_err());
+    }
+
+    /// 両側に同じテーマ（`--theme <name>` と同じ形）。
+    fn both_themes(name: &str) -> SyntaxThemes {
+        SyntaxThemes {
+            dark: Some(name.to_string()),
+            light: Some(name.to_string()),
+        }
+    }
+
+    /// 設定ファイルの中身を注入して解釈する（実ファイルは読まない）。
+    fn config_with_file(args: &[&str], toml: &str) -> Config {
+        let file = ConfigFile::parse(Path::new("/cfg/ashiato/config.toml"), toml, None).unwrap();
+        match Config::parse_with_file(args.iter().map(|s| s.to_string()), move || Ok(Some(file)))
+            .unwrap()
+        {
+            Action::Run(c) => c,
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn the_theme_sides_default_to_none_and_pick_by_background() {
+        assert_eq!(
+            run_config(&[]).theme,
+            SyntaxThemes::default(),
+            "既定は Highlighter が選ぶ"
+        );
+        let themes = SyntaxThemes {
+            dark: Some("D".into()),
+            light: Some("L".into()),
+        };
+        assert_eq!(themes.for_background(false), Some("D"));
+        assert_eq!(themes.for_background(true), Some("L"));
+        assert_eq!(SyntaxThemes::default().for_background(true), None);
+    }
+
+    #[test]
+    fn the_theme_dark_and_light_flags_set_one_side_each() {
+        assert_eq!(
+            run_config(&["--theme-dark", "Dracula"]).theme,
+            SyntaxThemes {
+                dark: Some("Dracula".into()),
+                light: None
+            },
+            "もう片側は既定のまま"
+        );
+        assert_eq!(
+            run_config(&["--theme-light", "Catppuccin Latte", "--theme-dark", "Nord"]).theme,
+            SyntaxThemes {
+                dark: Some("Nord".into()),
+                light: Some("Catppuccin Latte".into())
+            }
+        );
+    }
+
+    #[test]
+    fn the_theme_flag_covers_both_sides_and_beats_the_per_side_flags() {
+        // 1 本だったころの意味を変えない。どちらの背景でもそれを使う。
+        let c = run_config(&["--theme-dark", "Nord", "--theme", "Dracula"]);
+        assert_eq!(c.theme, both_themes("Dracula"));
+        // 順番に依らない（後ろの `--theme-light` にも勝つ）。
+        let c = run_config(&["--theme", "Dracula", "--theme-light", "Catppuccin Latte"]);
+        assert_eq!(c.theme, both_themes("Dracula"));
+    }
+
+    #[test]
+    fn the_config_file_theme_sits_under_the_flags() {
+        let toml = "[theme]\ndark = \"Nord\"\nlight = \"Catppuccin Latte\"\n";
+        // 設定ファイルだけ。
+        assert_eq!(
+            config_with_file(&[], toml).theme,
+            SyntaxThemes {
+                dark: Some("Nord".into()),
+                light: Some("Catppuccin Latte".into())
+            }
+        );
+        // 片側のフラグはその側だけを上書きする。
+        assert_eq!(
+            config_with_file(&["--theme-light", "Solarized (light)"], toml).theme,
+            SyntaxThemes {
+                dark: Some("Nord".into()),
+                light: Some("Solarized (light)".into())
+            }
+        );
+        // `--theme` は両側を上書きする。
+        assert_eq!(
+            config_with_file(&["--theme", "Dracula"], toml).theme,
+            both_themes("Dracula")
+        );
+        // 片側だけ書いた設定ファイルは、もう片側を既定に残す。
+        assert_eq!(
+            config_with_file(&[], "[theme]\nlight = \"Catppuccin Latte\"\n").theme,
+            SyntaxThemes {
+                dark: None,
+                light: Some("Catppuccin Latte".into())
+            }
+        );
+    }
+
+    #[test]
+    fn the_config_file_is_read_after_the_short_circuits_and_flag_errors() {
+        let broken = || -> Result<Option<ConfigFile>> { bail!("broken config") };
+        // 壊れた設定ファイルでも `--help` / `--version` は読める（直し方を
+        // 調べる道を塞がない）。
+        assert!(matches!(
+            Config::parse_with_file(["--help".to_string()], broken),
+            Ok(Action::Help)
+        ));
+        assert!(matches!(
+            Config::parse_with_file(["-V".to_string()], broken),
+            Ok(Action::Version)
+        ));
+        // フラグの誤りが先に出る。
+        let err = Config::parse_with_file(["--outpu".to_string()], broken)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("--outpu"), "{err}");
+        // それ以外は、設定ファイルのエラーで止まる。
+        let err = Config::parse_with_file(["--theme".to_string(), "Nord".to_string()], broken)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("broken config"), "{err}");
     }
 
     #[test]

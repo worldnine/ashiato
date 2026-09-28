@@ -34,7 +34,9 @@ ashiato [directory] [flags]
 | `--format <path\|tsv>` | `path` | `--files` の出力形式。`tsv` は `YYYY-MM-DD HH:MM:SS<TAB>basename<TAB>path` の3フィールド（fzf の `--with-nth` / `--nth` / `{1}` `{2}` `{3}` で表示・検索・プレビューを自由に組み合わせられる） |
 | `--since <today\|yesterday\|Nd\|Nw>` | — | 時間カットオフ。`--files` では出力を絞り、**TUI では起動時から指定より新しいファイルのみ表示**（プレビュー・クラスタ・`\` トグル等がそのまま効く） |
 | `--output` | — | 出力モードの明示指定（既定動作と同じ）。`--open-cmd` と排他 |
-| `--theme <name>` | —（`Catppuccin Mocha`） | プレビューの syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス。light 自動検出時は `Solarized (light)`） |
+| `--theme <name>` | — | プレビューの syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス）。light/dark の両側を上書きし、`--theme-dark` / `--theme-light` より強い |
+| `--theme-dark <name>` | `Catppuccin Mocha` | 背景が dark のときのテーマ |
+| `--theme-light <name>` | `Solarized (light)` | 背景が light のときのテーマ |
 | `--light` / `--dark` | 自動検出 | light/dark の明示指定。OSC 11 でターミナル背景色を問い合わせ、輝度 128 超で light。応答なしは dark |
 
 > 未知のフラグ・値のないフラグ・不正な値（`--sort bogus`、`--since bogus` 等）は
@@ -196,16 +198,22 @@ DarkGray が残るのはアウェイ差分の「さらに沈む側」（後述�
 
 ### テーマ
 
-- `--theme <name>`: two-face の埋め込みテーマ名（例: `Catppuccin Mocha`）または
-  `.tmTheme` ファイルパス（akapen と同じ引数）
+- テーマは dark 用と light 用の 2 本。値は two-face の埋め込みテーマ名（例:
+  `Catppuccin Mocha`）または `.tmTheme` ファイルパス（akapen と同じ引数）
 - light/dark は**自動判定**: 起動時 OSC 11（`ESC ] 11 ; ?`）でターミナル背景色を
   問い合わせ、輝度が 128 を超えれば light。応答しないターミナル（Terminal.app 等）は
   dark。`--light` / `--dark` で明示指定が最優先
-- `--theme` 未指定時: light なら `Solarized (light)`、dark なら `Catppuccin Mocha`
+- 判定の結果に合う側を使う。各側は `--theme-dark` / `--theme-light` > 設定ファイル
+  （`$XDG_CONFIG_HOME/ashiato/config.toml`、無ければ `~/.config/ashiato/config.toml`
+  の `[theme] dark` / `light`）> 既定（dark `Catppuccin Mocha` / light
+  `Solarized (light)`）。`--theme <name>` は両側を上書きする（1 本だったころの意味）。
+  名前が解決できないときは、その側の既定へ落ちる
 - TUI 色（選択行背景・外枠ボーダー）は akapen の `--light` と同一の定数で swap。
   ファイル名はテーマのデフォルト前景色で描画（light テーマでは暗色になる）。
   カーソル行のみ Cyan アクセント（akapen の view モードと同じモデル）
-- 将来的に設定ファイルが入ればそこで指定
+- 設定ファイルの知らないキー・型違い・壊れた TOML は、パスを添えた起動時の
+  エラー（フラグの typo と同じく黙って無視しない）。空・空白の値は書いていない
+  のと同じ、`~/` で始まる値はホームに展開する
 
 ### 表示制御（`--preview <on|off|auto>`）
 
