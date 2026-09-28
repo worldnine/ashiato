@@ -41,7 +41,7 @@ ashiato [directory] [flags]
 | `--theme <name>` | syntect テーマ（two-face 埋め込み名 or `.tmTheme` パス）。light/dark のどちらの背景でもこれを使い、`--theme-dark` / `--theme-light` より強い |
 | `--theme-dark <name>` | 背景が dark のときの syntect テーマ（既定 `Catppuccin Mocha`） |
 | `--theme-light <name>` | 背景が light のときの syntect テーマ（既定 `Solarized (light)`） |
-| `--light` / `--dark` | light/dark の明示指定。2 本のテーマのどちらを使うかもこれで決まる（既定: OSC 11 で自動検出） |
+| `--light` / `--dark` | light/dark の明示指定。2 本のテーマのどちらを使うかもこれで決まる（既定: 起動時に OSC 11 で自動検出し、開いている間はターミナルのライト／ダークの切り替えに追従。明示指定したときは追従しない） |
 | `--files` | TUI なしで時間順パス一覧を出力（fzf 等へのデータソース） |
 | `--format <path\|tsv>` | `--files` の出力形式（tsv = `日時<TAB>名前<TAB>パス`） |
 | `--since <today\|yesterday\|Nd\|Nw>` | 時間カットオフ（`--files` の絞り込み + TUI の初期表示） |
@@ -64,7 +64,7 @@ light = "Catppuccin Latte"
 | `[theme] dark` | `--theme-dark` | `--theme` > `--theme-dark` > 設定ファイル > `Catppuccin Mocha` |
 | `[theme] light` | `--theme-light` | `--theme` > `--theme-light` > 設定ファイル > `Solarized (light)` |
 
-- どちらの側を使うかは light/dark の判定（`--light` / `--dark`、無ければ OSC 11）に従います。名前が解決できない場合は、その側の既定へフォールバック。
+- どちらの側を使うかは light/dark の判定（`--light` / `--dark`、無ければ起動時の OSC 11 と、開いている間のターミナルの切り替え）に従います。名前が解決できない場合は、その側の既定へフォールバック。
 - 値が `~/` で始まれば展開します（`.tmTheme` のパス用）。空・空白だけの値は、書いていないのと同じです。
 - 知らないキー・型違い・壊れた TOML は、ファイルのパスを添えて起動時に止まります（タイプミスを黙って無視しない）。代わりに、新しい ashiato 向けに書いた設定（この版が知らないキー入り）を古い ashiato が読むと起動しません。`--help` と `--version` は設定ファイルを読みません。
 
@@ -146,11 +146,12 @@ ashiato --files --since 1w --filter .md | xargs akapen  # 今週の md をまと
 - プレビューは先頭 256KB まで。バイナリは file(1) 的な情報表示でクラッシュしません。
 - 速度優先プレビュー: j/k 連打（キーリピート）中はプレースホルダ表示でカーソル
   移動は一覧描画のみのコストに。キーを離すと ~40ms でプレビューが追いつきます。
-- light/dark は OSC 11 でターミナル背景色を問い合わせて自動判定（応答なしは dark）。
+- light/dark は OSC 11 でターミナル背景色を問い合わせて自動判定（応答なしは dark）。開いている間はターミナルの配色の知らせ（モード 2031）を購読し、切り替わったら（macOS の外観の切り替えなど）構文のテーマ・UI の色・プレビューを作り直します。モード 2031 を知らないターミナルでは起動時の判定のまま。子のコマンド（akapen など）に端末を渡す前と終わるときに購読を外し、戻ったら張り直します。
+- light/dark の配管 — OSC 11・モード 2031・その知らせを受けられる入力の読み手（crossterm 0.29 では受けられない）・テーマの解決・`[theme]` の表 — は [termtheme](https://github.com/worldnine/termtheme) のもの。
 - あえてやらないこと: ツリー表示・プレビュー内スクロール・ファジーマッチ・ABC ソート・アイコンフォント。詳細は [docs/spec.md](docs/spec.md)。
 
 ## ライセンス / クレジット
 
 MIT License。
 
-`src/highlight.rs` は [akapen](https://github.com/worldnine/akapen) のハイライタのコピーで、akapen は [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)（MIT, Dmitry Persiyanov）を翻案しています。
+`src/highlight.rs` は [akapen](https://github.com/worldnine/akapen) のハイライタのコピー（テーマの部分は termtheme へ移った）で、akapen は [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)（MIT, Dmitry Persiyanov）を翻案しています。

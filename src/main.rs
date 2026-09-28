@@ -55,8 +55,8 @@ use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event, KeyCode,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -65,6 +65,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use termtheme::config::ThemeFlags;
+use termtheme::input::{self, Input};
+use termtheme::scheme::{DisableColorSchemeUpdates, EnableColorSchemeUpdates, QueryColorScheme};
+use termtheme::theme::ThemePair;
 
 use crate::config_file::ConfigFile;
 use crate::files::{Cluster, FileEntry, Sort, cluster_of, format_time, is_fresh, to_local};
@@ -121,42 +125,22 @@ struct Config {
     /// `--output`: Enter prints the selected paths to stdout and exits.
     output: bool,
     /// シンタックスハイライトのテーマ。背景が dark のときと light のときの
-    /// 2 本で、どちらを使うかは起動時の判定（`--light` / `--dark` か OSC 11）が
-    /// 決める（[`SyntaxThemes::for_background`]）。
+    /// 2 本で、どちらを使うかは light/dark の判定（`--light` / `--dark`、無ければ
+    /// 起動時の OSC 11 と、開いている間の配色の知らせ）が決める
+    /// （`ThemePair::for_background`）。
     ///
     /// 各側は `--theme-dark` / `--theme-light` > 設定ファイルの `[theme]` >
     /// 既定。`--theme <name>` は**両側を上書きする**（どちらでもそれを使う。
     /// 1 本だったころの意味のまま）。値は syntect のテーマ名か `.tmTheme` の
-    /// パス。
-    theme: SyntaxThemes,
+    /// パス。`None` の側は既定 —— [`Highlighter::new`] が light/dark に合ったもの
+    /// （`Catppuccin Mocha` / `Solarized (light)`）を選ぶ。名前が解決できない
+    /// ときも同じ既定へ落ちる。
+    theme: ThemePair,
     /// `--light` / `--dark`: force the TUI's light/dark mode.
     /// `None` (the default) = auto-detect the terminal background via
     /// OSC 11, falling back to dark when the terminal doesn't answer.
+    /// 固定されているときは、端末の配色の知らせ（モード 2031）を無視する。
     light: Option<bool>,
-}
-
-/// 背景ごとのシンタックスハイライトのテーマ（[`Config::theme`]）。
-///
-/// `None` は既定 —— [`Highlighter::new`] が light/dark に合ったもの
-/// （`Catppuccin Mocha` / `Solarized (light)`）を選ぶ。名前が解決できない
-/// ときも同じ既定へ落ちる。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SyntaxThemes {
-    /// 背景が dark のとき。
-    dark: Option<String>,
-    /// 背景が light のとき。
-    light: Option<String>,
-}
-
-impl SyntaxThemes {
-    /// 背景に合う側。
-    fn for_background(&self, light: bool) -> Option<&str> {
-        if light {
-            self.light.as_deref()
-        } else {
-            self.dark.as_deref()
-        }
-    }
 }
 
 /// What the process should do, resolved from argv.
@@ -391,19 +375,15 @@ impl Config {
             bail!("--output and --alt-open-cmd are mutually exclusive");
         }
         let file = config_file()?;
-        let file = file.as_ref();
         // テーマ。`--theme` は両側を上書きする（1 本だったころの意味のまま、
         // `--theme-dark` / `--theme-light` より強い）。各側はフラグ > 設定
         // ファイル > 既定（`None`、[`Highlighter::new`]）。
-        let theme = SyntaxThemes {
-            dark: theme
-                .clone()
-                .or(theme_dark)
-                .or_else(|| file.and_then(|f| f.theme_dark.clone())),
-            light: theme
-                .or(theme_light)
-                .or_else(|| file.and_then(|f| f.theme_light.clone())),
-        };
+        let theme = ThemeFlags {
+            both: theme,
+            dark: theme_dark,
+            light: theme_light,
+        }
+        .over(file.as_ref().map(|f| &f.theme));
         Ok(Action::Run(Config {
             dir,
             sort,
@@ -470,10 +450,13 @@ fn main() -> Result<()> {
                  \x20                   (default Catppuccin Mocha)\n\
                  \x20 --theme-light <name> the theme on a light background\n\
                  \x20                   (default Solarized (light)). Which side\n\
-                 \x20                   applies follows --light/--dark or OSC 11\n\
+                 \x20                   applies follows --light/--dark, else OSC 11\n\
+                 \x20                   and the terminal's light/dark switches\n\
                  \x20 --light           force light mode (default: auto-detect\n\
-                 \x20                   the terminal background via OSC 11)\n\
-                 \x20 --dark            force dark mode\n\
+                 \x20                   the terminal background via OSC 11, then\n\
+                 \x20                   follow its switches while open — mode 2031)\n\
+                 \x20 --dark            force dark mode (forced modes ignore the\n\
+                 \x20                   switches)\n\
                  \x20 --files         no TUI: print the time-sorted listing\n\
                  \x20 --format <path|tsv>  --files output (tsv = time column)\n\
                  \x20 --since <today|yesterday|Nd|Nw>  --files cutoff\n\
@@ -551,10 +534,13 @@ struct App {
     sort: Sort,
     show_hidden: bool,
     show_dirs: bool,
+    /// 今の light/dark（起動時に決め、配色の知らせで入れ替わる —
+    /// [`App::follow_scheme`]）。下の 3 つはここから導いたもの。
+    light: bool,
     /// syntect highlighter shared with akapen (two-face themes).
     highlight: Highlighter,
     /// Resolved UI colors for the current light/dark mode (akapen's
-    /// `--light` pattern: the same constants, resolved once at startup).
+    /// `--light` pattern: the same constants). [`App::set_light`] で作り直す。
     ui_selected_bg: Color,
     ui_border: Color,
     /// Preview pane cache: re-rendered only when the key changes.
@@ -662,6 +648,30 @@ impl App {
         let _ = out.write_all(b"\x07");
         let _ = out.flush();
         self.status = Some((msg.into(), Instant::now(), true));
+    }
+
+    /// 端末の配色についての知らせ（モード 2031 の `CSI ? 997 ; n n`、`CSI ? 996 n`
+    /// への答え、遅れて届いた OSC 11 の答え）を受けたとき。`--light` / `--dark`
+    /// で固定されていれば無視する（固定は固定）。light/dark が変わったら
+    /// [`App::set_light`] で作り直して `true`。
+    fn follow_scheme(&mut self, light: bool) -> bool {
+        if self.config.light.is_some() || light == self.light {
+            return false;
+        }
+        self.set_light(light);
+        true
+    }
+
+    /// light/dark を入れ替え、`light` から導いているものを全部作り直す: 構文の
+    /// テーマ（[`ThemePair`] のその側。`--theme` で両側が同じでも、既定の文字色は
+    /// 背景で変わる）、UI の色（選択の背景・枠）、描画済みのプレビュー
+    /// （キャッシュのキーに light は入っていない）。画面には次の描画で出る。
+    fn set_light(&mut self, light: bool) {
+        self.light = light;
+        self.highlight = Highlighter::new(self.config.theme.for_background(light), light);
+        self.ui_selected_bg = theme::selected_bg(light);
+        self.ui_border = theme::border_color(light);
+        self.preview_cache = None;
     }
 
     /// Focus lost: start a fresh away-diff stack — only the changes
@@ -1114,21 +1124,71 @@ fn make_terminal() -> Result<Term> {
 /// `DisableFocusChange`; without the re-send, the away-diff feature
 /// (external edits while the terminal is unfocused) would stay dead for
 /// the rest of the session.
+///
+/// 配色の知らせ（モード 2031）の購読もここで始める。購読は端末の状態で、
+/// プロセスが終わっても残るので、端末を手放すとき（終わるとき・panic・
+/// シグナル・子プロセスに渡すとき・Ctrl+Z）は必ず `DisableColorSchemeUpdates`
+/// を送る — 外し忘れると、子の akapen や後のシェルに知らせが届き、crossterm で
+/// 読むものはそこで止まる。
 fn enter_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
     use ratatui::crossterm::QueueableCommand;
     w.queue(EnterAlternateScreen)?;
     w.queue(Hide)?;
     w.queue(EnableMouseCapture)?;
     w.queue(EnableFocusChange)?;
+    w.queue(EnableColorSchemeUpdates)?;
     w.flush()
 }
 
+/// 子プロセス（や Ctrl+Z の停止）から戻ったときの [`enter_tui_modes`]。
+/// 離れている間に配色が変わったかもしれないので、今の配色も問い合わせる
+/// （`CSI ? 996 n`。答えは知らせと同じ形で届き、[`App::follow_scheme`] が拾う）。
+fn resume_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    use ratatui::crossterm::QueueableCommand;
+    enter_tui_modes(w)?;
+    w.queue(QueryColorScheme)?;
+    w.flush()
+}
+
+/// 端末を手放すときに戻すもの — [`enter_tui_modes`] の逆で、配色の知らせの
+/// 購読も外す。終わるとき（[`TermGuard`] の Drop。panic の巻き戻しも）・
+/// シグナル（[`install_signal_handlers`] が前もって列にしておく）・Ctrl+Z
+/// （[`suspend_tui`]）で使う。
+fn leave_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    ratatui::crossterm::queue!(
+        w,
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableFocusChange,
+        DisableColorSchemeUpdates
+    )?;
+    w.flush()
+}
+
+/// 子プロセス（`--open-cmd` の akapen など）に端末を渡す前に戻すもの。
+/// フォーカスの報告は今までどおり残す（子の多くは自分で張り、出るときに外す）
+/// が、配色の知らせの購読は必ず外す — 子の akapen は自分で購読し、crossterm で
+/// 読む子は届いた知らせで止まる。
+fn leave_for_child(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(
+        w,
+        LeaveAlternateScreen,
+        Show,
+        DisableMouseCapture,
+        DisableColorSchemeUpdates
+    )
+}
+
 /// When stdin is not a terminal (xargs gives children /dev/null; scripts
-/// redirect it), rebind fd 0 to a real tty so crossterm's event reader
-/// can initialize. On macOS this must be the actual pty slave: /dev/tty
-/// is a synthetic node that kqueue (mio) rejects with EINVAL, and
-/// crossterm's own /dev/tty fallback therefore fails with "Failed to
-/// initialize input reader" (`ashiato --files | xargs akapen` dies).
+/// redirect it), rebind fd 0 to a real tty so the input reader can read
+/// it. On macOS this must be the actual pty slave: /dev/tty is a
+/// synthetic node that kqueue (mio) rejects with EINVAL, and crossterm's
+/// own /dev/tty fallback therefore failed with "Failed to initialize
+/// input reader" (`ashiato --files | xargs akapen` died). 今は入力を
+/// termtheme の読み手で読む（macOS では select で待つので /dev/tty も読める）
+/// が、起動時の背景色の判定（OSC 11）は stdin が端末のときだけ問い合わせ、
+/// 答えも stdin から読むので、張り替えは今も要る。
 fn ensure_terminal_stdin() {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
@@ -1139,7 +1199,7 @@ fn ensure_terminal_stdin() {
         return;
     }
     // Other platforms (and macOS without a matching pty): the controlling
-    // terminal node itself — epoll etc. accept it, so crossterm works.
+    // terminal node itself — poll(2) accepts it there.
     if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
         use std::os::fd::AsRawFd;
         // SAFETY: both fds are valid; dup2 replaces fd 0 with the tty.
@@ -1225,13 +1285,7 @@ impl Drop for TermGuard {
         // landing mid-restore would double-leave the alternate screen).
         TUI_ACTIVE.store(false, Ordering::SeqCst);
         if self.alt && let Some(t) = &mut self.term {
-            let _ = execute!(
-                t.backend_mut(),
-                Show,
-                DisableMouseCapture,
-                LeaveAlternateScreen,
-                DisableFocusChange
-            );
+            let _ = leave_tui_modes(t.backend_mut());
         }
         if self.raw {
             let _ = ratatui::crossterm::terminal::disable_raw_mode();
@@ -1257,13 +1311,14 @@ impl std::ops::DerefMut for TermGuard {
     }
 }
 
-/// The restore sequences the signal handler writes (built once from the
-/// real crossterm commands, so they can't drift from the normal teardown;
+/// The restore sequences the signal handler writes (built once by
+/// [`leave_tui_modes`], the normal teardown itself, so they can't drift;
 /// the handler itself must not allocate or open anything).
 static TERMINAL_RESTORE: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// SIGINT/SIGTERM handler: leave the alternate screen (and show the
-/// cursor, stop mouse/focus reporting), then re-raise with the default
+/// cursor, stop mouse/focus reporting and the color-scheme
+/// subscription), then re-raise with the default
 /// disposition so the process dies with the conventional signal status.
 /// The handler writes only to the already-open stdout/stderr fds: on
 /// macOS, opening /dev/tty or calling tcsetattr from a handler races
@@ -1296,13 +1351,7 @@ extern "C" fn restore_terminal_and_die(sig: libc::c_int) {
 fn install_signal_handlers() {
     // Build the restore bytes eagerly: the handler must not allocate.
     let mut restore = Vec::new();
-    let _ = ratatui::crossterm::queue!(
-        restore,
-        Show,
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableFocusChange
-    );
+    let _ = leave_tui_modes(&mut restore);
     let _ = TERMINAL_RESTORE.set(restore);
     unsafe {
         // SAFETY: `restore_terminal_and_die` is a valid handler, and
@@ -1339,13 +1388,16 @@ fn run(config: Config) -> Result<()> {
         alt: false,
     };
     guard.raw_on();
+    // 起動時の判定の待ちのあいだに打たれたキー（先打ち）は、termtheme が捨てずに
+    // 入力の読み手（event_loop）へ渡す。
     let light = config
         .light
-        .unwrap_or_else(|| theme::detect_light().unwrap_or(false));
+        .unwrap_or_else(|| termtheme::background::detect_light().unwrap_or(false));
     // The syntax theme: the side matching light/dark (--theme covers both,
     // else --theme-dark / --theme-light, else the config file's [theme]);
     // a missing or unresolvable name falls back to that side's default
-    // (Highlighter::new).
+    // (Highlighter::new). 開いている間に配色が変われば App::set_light が
+    // 作り直す。
     let highlight = Highlighter::new(config.theme.for_background(light), light);
     let mut app = App {
         config,
@@ -1362,6 +1414,7 @@ fn run(config: Config) -> Result<()> {
         sort: Sort::MtimeDesc,
         show_hidden: false,
         show_dirs: false,
+        light,
         highlight,
         ui_selected_bg: theme::selected_bg(light),
         ui_border: theme::border_color(light),
@@ -1433,7 +1486,7 @@ fn run(config: Config) -> Result<()> {
 /// Whether this process still has a controlling terminal — i.e. the
 /// pane/window this TUI runs in is alive. When the session leader exits
 /// (window/pane closed) the kernel releases the controlling terminal and
-/// `/dev/tty` stops opening (ENXIO), even though crossterm reads keep
+/// `/dev/tty` stops opening (ENXIO), even though reads of the pty keep
 /// blocking (the pty master may stay open — herdr keeps it for
 /// scrollback). Polled every tick as a death watchdog.
 fn controlling_terminal_alive() -> bool {
@@ -1441,15 +1494,16 @@ fn controlling_terminal_alive() -> bool {
 }
 
 /// Whether stdin's writer is gone (POLLHUP): a pipe-based virtual
-/// terminal (e.g. a herdr plugin pane) whose owner closed. Reads would
-/// return EOF forever — crossterm never surfaces that as an event.
+/// terminal (e.g. a herdr plugin pane) whose owner closed. Reads return
+/// EOF forever. termtheme の読み手はそれを `Err` にして event_loop を抜けるが、
+/// 子プロセスを待っている間は読まないので、ここで見る。
 fn stdin_hung_up() -> bool {
     let mut pfd = libc::pollfd {
         fd: libc::STDIN_FILENO,
         events: 0,
         revents: 0,
     };
-    // SAFETY: poll(2) on fd 0, which is open here (crossterm owns it).
+    // SAFETY: poll(2) on fd 0, which is open here (the input reader reads it).
     let n = unsafe { libc::poll(&mut pfd, 1, 0) };
     n > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
@@ -1473,7 +1527,10 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
         // after the key is released instead of waiting out the full tick.
         let timeout = poll_timeout(app.bursting, app.last_input.elapsed());
         let mut any_input = false;
-        if event::poll(timeout)? {
+        // 入力は termtheme の読み手で読む（crossterm の event::poll / read は
+        // 使わない）。crossterm 0.29 は配色の知らせ（`CSI ? 997 ; n n`）を受けると
+        // 後ろの入力を飲み込み、poll ごと止まる。
+        if input::poll(timeout)? {
             for _ in 0..MAX_EVENTS_PER_FRAME {
                 // A child process just exited and the terminal was
                 // re-initialized: draw now, don't drain stale events.
@@ -1481,11 +1538,11 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
                     app.needs_immediate_redraw = false;
                     break;
                 }
-                if !event::poll(Duration::ZERO)? {
+                if !input::poll(Duration::ZERO)? {
                     break;
                 }
-                match event::read()? {
-                    Event::Key(key) => {
+                match input::read()? {
+                    Input::Event(Event::Key(key)) => {
                         mark_input(app);
                         any_input = true;
                         // Release/Repeat kinds (kitty protocol) don't
@@ -1495,14 +1552,21 @@ fn event_loop(terminal: &mut TermGuard, app: &mut App) -> Result<()> {
                             on_key(app, key.code, key.modifiers, Some(terminal));
                         }
                     }
-                    Event::Mouse(mouse) => {
+                    Input::Event(Event::Mouse(mouse)) => {
                         mark_input(app);
                         any_input = true;
                         on_mouse(app, mouse);
                     }
-                    Event::FocusGained => app.focus_gained(),
-                    Event::FocusLost => app.focus_lost(),
-                    _ => {}
+                    Input::Event(Event::FocusGained) => app.focus_gained(),
+                    Input::Event(Event::FocusLost) => app.focus_lost(),
+                    Input::Event(_) => {}
+                    // 配色の知らせ・背景色の答え: 作り直しは follow_scheme、
+                    // 描き直しはこのフレームの終わりの draw。
+                    other => {
+                        if let Some(light) = other.light() {
+                            app.follow_scheme(light);
+                        }
+                    }
                 }
             }
         }
@@ -1655,7 +1719,7 @@ fn mark_input(app: &mut App) {
     app.last_input = now;
 }
 
-/// バースト中の `event::poll` タイムアウト。バースト終了予定（前回入力から
+/// バースト中の `input::poll` タイムアウト。バースト終了予定（前回入力から
 /// [`BURST_GAP`]）ちょうどに目覚めるよう残り時間を返すが、重いフレーム
 /// （プレビュー描画や再スキャン）の直後は `quiet` が既に BURST_GAP を
 /// 超えていることがあるため、飽和減算でパニックを避け下限 5ms に丸める。
@@ -1780,8 +1844,8 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
         // editor pattern): leave the alternate screen and raw mode, and
         // disarm the guard — the child owns the terminal now, so a
         // panic or signal mid-child must not restore it out from under
-        // the child.
-        let _ = execute!(g.backend_mut(), LeaveAlternateScreen, Show, DisableMouseCapture);
+        // the child. 配色の知らせの購読も外す（leave_for_child）。
+        let _ = leave_for_child(g.backend_mut());
         g.alt = false;
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
         g.raw_off();
@@ -1823,8 +1887,9 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
                 **g = term;
                 // Re-send focus reporting along with the screen re-entry:
                 // the child may have sent DisableFocusChange on its way
-                // out, which would kill the away-diff silently.
-                let _ = enter_tui_modes(g.backend_mut());
+                // out, which would kill the away-diff silently. 購読も
+                // 張り直し、離れている間に変わった配色を問い合わせる。
+                let _ = resume_tui_modes(g.backend_mut());
                 g.alt = true;
             }
             Err(e) => {
@@ -1883,13 +1948,7 @@ fn suspend_tui(app: &mut App, terminal: Option<&mut TermGuard>) {
         app.flash("not a foreground job — can't suspend");
         return;
     }
-    let _ = execute!(
-        g.backend_mut(),
-        LeaveAlternateScreen,
-        Show,
-        DisableMouseCapture,
-        DisableFocusChange
-    );
+    let _ = leave_tui_modes(g.backend_mut());
     g.alt = false;
     let _ = ratatui::crossterm::terminal::disable_raw_mode();
     g.raw_off();
@@ -1898,19 +1957,14 @@ fn suspend_tui(app: &mut App, terminal: Option<&mut TermGuard>) {
         // already restored, so the shell gets a clean prompt.
         libc::raise(libc::SIGTSTP);
     }
-    // Resumed (fg): re-enter raw mode and rebuild the TUI.
+    // Resumed (fg): re-enter raw mode and rebuild the TUI. 購読も張り直し、
+    // 止まっている間に変わった配色を問い合わせる。
     let _ = ratatui::crossterm::terminal::enable_raw_mode();
     g.raw_on();
     match make_terminal() {
         Ok(term) => {
             **g = term;
-            let _ = execute!(
-                g.backend_mut(),
-                EnterAlternateScreen,
-                Hide,
-                EnableMouseCapture,
-                EnableFocusChange
-            );
+            let _ = resume_tui_modes(g.backend_mut());
             g.alt = true;
         }
         Err(e) => {
@@ -2585,7 +2639,7 @@ mod tests {
     #[test]
     fn theme_and_light_flags_parse() {
         let c = run_config(&["--theme", "Nord"]);
-        assert_eq!(c.theme, both_themes("Nord"));
+        assert_eq!(c.theme, ThemePair::both("Nord"));
         assert_eq!(c.light, None); // default: auto-detect
         assert_eq!(run_config(&["--light"]).light, Some(true));
         assert_eq!(run_config(&["--dark"]).light, Some(false));
@@ -2596,14 +2650,6 @@ mod tests {
         assert!(Config::parse(["--theme".to_string()]).is_err());
         assert!(Config::parse(["--theme-dark".to_string()]).is_err());
         assert!(Config::parse(["--theme-light".to_string()]).is_err());
-    }
-
-    /// 両側に同じテーマ（`--theme <name>` と同じ形）。
-    fn both_themes(name: &str) -> SyntaxThemes {
-        SyntaxThemes {
-            dark: Some(name.to_string()),
-            light: Some(name.to_string()),
-        }
     }
 
     /// 設定ファイルの中身を注入して解釈する（実ファイルは読まない）。
@@ -2621,23 +2667,23 @@ mod tests {
     fn the_theme_sides_default_to_none_and_pick_by_background() {
         assert_eq!(
             run_config(&[]).theme,
-            SyntaxThemes::default(),
+            ThemePair::default(),
             "既定は Highlighter が選ぶ"
         );
-        let themes = SyntaxThemes {
+        let themes = ThemePair {
             dark: Some("D".into()),
             light: Some("L".into()),
         };
         assert_eq!(themes.for_background(false), Some("D"));
         assert_eq!(themes.for_background(true), Some("L"));
-        assert_eq!(SyntaxThemes::default().for_background(true), None);
+        assert_eq!(ThemePair::default().for_background(true), None);
     }
 
     #[test]
     fn the_theme_dark_and_light_flags_set_one_side_each() {
         assert_eq!(
             run_config(&["--theme-dark", "Dracula"]).theme,
-            SyntaxThemes {
+            ThemePair {
                 dark: Some("Dracula".into()),
                 light: None
             },
@@ -2645,7 +2691,7 @@ mod tests {
         );
         assert_eq!(
             run_config(&["--theme-light", "Catppuccin Latte", "--theme-dark", "Nord"]).theme,
-            SyntaxThemes {
+            ThemePair {
                 dark: Some("Nord".into()),
                 light: Some("Catppuccin Latte".into())
             }
@@ -2656,10 +2702,10 @@ mod tests {
     fn the_theme_flag_covers_both_sides_and_beats_the_per_side_flags() {
         // 1 本だったころの意味を変えない。どちらの背景でもそれを使う。
         let c = run_config(&["--theme-dark", "Nord", "--theme", "Dracula"]);
-        assert_eq!(c.theme, both_themes("Dracula"));
+        assert_eq!(c.theme, ThemePair::both("Dracula"));
         // 順番に依らない（後ろの `--theme-light` にも勝つ）。
         let c = run_config(&["--theme", "Dracula", "--theme-light", "Catppuccin Latte"]);
-        assert_eq!(c.theme, both_themes("Dracula"));
+        assert_eq!(c.theme, ThemePair::both("Dracula"));
     }
 
     #[test]
@@ -2668,7 +2714,7 @@ mod tests {
         // 設定ファイルだけ。
         assert_eq!(
             config_with_file(&[], toml).theme,
-            SyntaxThemes {
+            ThemePair {
                 dark: Some("Nord".into()),
                 light: Some("Catppuccin Latte".into())
             }
@@ -2676,7 +2722,7 @@ mod tests {
         // 片側のフラグはその側だけを上書きする。
         assert_eq!(
             config_with_file(&["--theme-light", "Solarized (light)"], toml).theme,
-            SyntaxThemes {
+            ThemePair {
                 dark: Some("Nord".into()),
                 light: Some("Solarized (light)".into())
             }
@@ -2684,12 +2730,12 @@ mod tests {
         // `--theme` は両側を上書きする。
         assert_eq!(
             config_with_file(&["--theme", "Dracula"], toml).theme,
-            both_themes("Dracula")
+            ThemePair::both("Dracula")
         );
         // 片側だけ書いた設定ファイルは、もう片側を既定に残す。
         assert_eq!(
             config_with_file(&[], "[theme]\nlight = \"Catppuccin Latte\"\n").theme,
-            SyntaxThemes {
+            ThemePair {
                 dark: None,
                 light: Some("Catppuccin Latte".into())
             }
@@ -2991,6 +3037,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3054,6 +3101,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3095,6 +3143,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3153,6 +3202,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3212,6 +3262,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3294,6 +3345,7 @@ mod tests {
             sort: Sort::MtimeDesc,
             show_hidden: false,
             show_dirs: false,
+            light: false,
             highlight: Highlighter::new(None, false),
             ui_selected_bg: theme::selected_bg(false),
             ui_border: theme::border_color(false),
@@ -3927,5 +3979,122 @@ mod tests {
             file_line(&app, idx, 80, false, now, false).to_string().contains("+1"),
             "rescan refreshes the git snapshot"
         );
+    }
+
+    /// Catppuccin の本文の色（Mocha はダーク、Latte はライト）。
+    const MOCHA_FG: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+    const LATTE_FG: Color = Color::Rgb(0x4c, 0x4f, 0x69);
+
+    /// 配色の知らせのテスト用の App: `args` のフラグで、`light` から始め、
+    /// プレビューに映る Markdown のファイルを 1 つ置く。
+    fn scheme_app(args: &[&str], light: bool) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "plain text\n").unwrap();
+        let mut app = test_app(files::scan(dir.path(), false, false).unwrap());
+        app.root = dir.path().to_path_buf();
+        app.config = run_config(args);
+        app.set_light(light);
+        app.rebuild_visible(None);
+        (dir, app)
+    }
+
+    /// プレビューの本文の最初の字の色（描画済みならキャッシュから）。
+    fn preview_fg(app: &mut App) -> Option<Color> {
+        let lines = app.preview_lines(40, 10);
+        lines.get(1)?.spans.first()?.style.fg
+    }
+
+    const CATPPUCCIN: &[&str] = &[
+        "--theme-dark",
+        "Catppuccin Mocha",
+        "--theme-light",
+        "Catppuccin Latte",
+    ];
+
+    #[test]
+    fn a_color_scheme_notice_rebuilds_everything_derived_from_light() {
+        let (_dir, mut app) = scheme_app(CATPPUCCIN, false);
+        assert_eq!(preview_fg(&mut app), Some(MOCHA_FG));
+        assert!(app.preview_cache.is_some(), "描画済み");
+        // ライトになった知らせ: 構文のテーマ・UI の色・描画済みのプレビューを
+        // 作り直す（プレビューのキャッシュのキーは変わらないので、残せば古い色）。
+        assert!(app.follow_scheme(true));
+        assert!(app.light);
+        assert_eq!(app.ui_selected_bg, theme::selected_bg(true));
+        assert_eq!(app.ui_border, theme::border_color(true));
+        assert_eq!(app.highlight.default_fg(), LATTE_FG);
+        assert_eq!(preview_fg(&mut app), Some(LATTE_FG));
+        // ダークに戻った知らせ。
+        assert!(app.follow_scheme(false));
+        assert!(!app.light);
+        assert_eq!(app.ui_selected_bg, theme::selected_bg(false));
+        assert_eq!(app.ui_border, theme::border_color(false));
+        assert_eq!(preview_fg(&mut app), Some(MOCHA_FG));
+    }
+
+    #[test]
+    fn the_same_scheme_again_keeps_the_rendered_preview() {
+        // 戻ったときの問い合わせ（CSI ? 996 n）の答えは、たいてい今と同じ。
+        let (_dir, mut app) = scheme_app(CATPPUCCIN, false);
+        preview_fg(&mut app);
+        assert!(!app.follow_scheme(false));
+        assert!(app.preview_cache.is_some(), "作り直すものは無い");
+    }
+
+    #[test]
+    fn a_fixed_light_or_dark_ignores_notices() {
+        for (flag, light) in [("--dark", false), ("--light", true)] {
+            let mut args = vec![flag];
+            args.extend_from_slice(CATPPUCCIN);
+            let (_dir, mut app) = scheme_app(&args, light);
+            let fg = preview_fg(&mut app);
+            assert!(!app.follow_scheme(!light), "{flag}");
+            assert_eq!(app.light, light, "{flag}");
+            assert_eq!(app.ui_selected_bg, theme::selected_bg(light), "{flag}");
+            assert_eq!(app.ui_border, theme::border_color(light), "{flag}");
+            assert_eq!(preview_fg(&mut app), fg, "{flag}");
+        }
+    }
+
+    #[test]
+    fn one_theme_on_both_sides_still_swaps_the_ui_colors() {
+        let (_dir, mut app) = scheme_app(&["--theme", "Catppuccin Mocha"], false);
+        assert!(app.follow_scheme(true));
+        assert_eq!(app.ui_selected_bg, theme::selected_bg(true));
+        assert_eq!(app.ui_border, theme::border_color(true));
+        assert_eq!(
+            preview_fg(&mut app),
+            Some(MOCHA_FG),
+            "構文のテーマは両側とも Mocha"
+        );
+    }
+
+    #[test]
+    fn the_tui_subscribes_and_unsubscribes_before_every_hand_off() {
+        let bytes = |f: fn(&mut Vec<u8>) -> std::io::Result<()>| {
+            let mut out = Vec::new();
+            f(&mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let enter = bytes(enter_tui_modes);
+        assert!(enter.contains("\x1b[?2031h"), "起動時に購読する");
+        assert!(
+            !enter.contains("\x1b[?996n"),
+            "起動時の判定は OSC 11 のまま"
+        );
+        // 戻ったら張り直してから、離れている間に変わった分を問い合わせる。
+        let resume = bytes(resume_tui_modes);
+        let subscribe = resume.find("\x1b[?2031h").expect("張り直す");
+        let query = resume.find("\x1b[?996n").expect("問い合わせる");
+        assert!(subscribe < query);
+        // 終わるとき・シグナル・Ctrl+Z（leave_tui_modes）と子に渡すとき
+        // （leave_for_child）は外す。
+        for (name, seq) in [
+            ("leave_tui_modes", bytes(leave_tui_modes)),
+            ("leave_for_child", bytes(leave_for_child)),
+        ] {
+            assert!(seq.contains("\x1b[?2031l"), "{name}");
+            assert!(!seq.contains("\x1b[?2031h"), "{name}");
+        }
     }
 }
