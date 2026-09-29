@@ -94,6 +94,14 @@ impl Sort {
 /// appended last — entries that disappeared from the listing. The
 /// away-diff uses this to accumulate external edits while the terminal
 /// is unfocused.
+///
+/// Known blind spot: a rewrite to the same size within the clock's
+/// granularity (a few ms on Linux) keeps `(mtime, size)` identical, so it
+/// is invisible here — and the same comparison gates the preview cache,
+/// `refresh_if_changed`'s commit and git's re-query, so their marks stay
+/// stale until the next change (or cursor move). If it ever needs fixing,
+/// do what racy git does: flag only files whose mtime is close to the
+/// scan time and content-check just those on the next scan.
 pub fn changed_paths(old: &[FileEntry], new: &[FileEntry]) -> Vec<PathBuf> {
     let key = |e: &FileEntry| (e.mtime, e.size, e.is_dir);
     let mut seen: std::collections::BTreeMap<&Path, (SystemTime, u64, bool)> =
