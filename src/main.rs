@@ -3190,7 +3190,20 @@ mod tests {
     fn away_diff_accumulates_while_unfocused_then_flashes_and_reverts() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("a.txt");
-        std::fs::write(&f, "v1").unwrap();
+        // 更新時刻は環境の時計の粒度（Linux では数 ms）に任せず明示する。
+        // 同じ大きさで続けて書き換えると、粗い環境では mtime が一致して
+        // 変化として見えないため（検出は mtime・大きさ・種別の比較）。
+        let base = std::time::SystemTime::now() - Duration::from_secs(1000);
+        let write_at = |path: &Path, body: &str, secs: u64| {
+            std::fs::write(path, body).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(base + Duration::from_secs(secs))
+                .unwrap();
+        };
+        write_at(&f, "v1", 0);
         let mut app = App {
             config: run_config(&[]),
             root: dir.path().to_path_buf(),
@@ -3226,15 +3239,15 @@ mod tests {
             running: true,
         };
         // Focused: edits don't accumulate.
-        std::fs::write(&f, "v2").unwrap();
+        write_at(&f, "v2", 10);
         app.refresh_if_changed();
         assert!(app.away_changes.is_empty(), "focused edits are not away-changes");
         // Away: edits stack up, deduped, in first-seen order.
         app.focus_lost();
-        std::fs::write(&f, "v3").unwrap();
+        write_at(&f, "v3", 20);
         app.refresh_if_changed();
         let g = dir.path().join("b.txt");
-        std::fs::write(&g, "x").unwrap();
+        write_at(&g, "x", 30);
         app.refresh_if_changed();
         assert_eq!(app.away_changes.len(), 2, "two files changed while away");
         assert_eq!(app.away_changes[0], f);
