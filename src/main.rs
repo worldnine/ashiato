@@ -1861,8 +1861,12 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
     // dies (pane/window closed) the child would otherwise leak and spin
     // forever in a dead session. Kill it and bail — the terminal is gone,
     // so restoring it is pointless.
-    let watch_terminal = controlling_terminal_alive();
-    let watch_stdin = !watch_terminal;
+    // TUI を持たないとき（テスト等）は守る対象のセッションが無い。stdin が
+    // 書き手のいないパイプだと POLLHUP になり、子を kill して rescan の前に
+    // 抜けてしまうので、見張りは TUI を持っているときだけ張る。
+    let watching = terminal.is_some();
+    let watch_terminal = watching && controlling_terminal_alive();
+    let watch_stdin = watching && !watch_terminal;
     let status = loop {
         if (watch_terminal && !controlling_terminal_alive())
             || (watch_stdin && stdin_hung_up())
