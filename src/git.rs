@@ -60,8 +60,9 @@ impl GitStatus {
 /// Signature of one listing entry: `(path, mtime, size, is_dir)` — the
 /// away-diff's triple plus the path. When no component changed since
 /// the last query, `git status` output cannot have changed (mode-only
-/// edits are the known blind spot, shared with the away-diff, and
-/// tolerable under P4's snapshot principle).
+/// edits and a same-size rewrite within the clock's granularity are the
+/// known blind spots, shared with the away-diff, and tolerable under P4's
+/// snapshot principle).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FileSig {
     path: PathBuf,
