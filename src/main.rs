@@ -67,7 +67,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use termtheme::config::ThemeFlags;
 use termtheme::input::{self, Input};
-use termtheme::scheme::{DisableColorSchemeUpdates, EnableColorSchemeUpdates, QueryColorScheme};
+use termtheme::scheme::Subscription;
 use termtheme::theme::ThemePair;
 
 use crate::config_file::ConfigFile;
@@ -1125,59 +1125,39 @@ fn make_terminal() -> Result<Term> {
 /// (external edits while the terminal is unfocused) would stay dead for
 /// the rest of the session.
 ///
-/// 配色の知らせ（モード 2031）の購読もここで始める。購読は端末の状態で、
-/// プロセスが終わっても残るので、端末を手放すとき（終わるとき・panic・
-/// シグナル・子プロセスに渡すとき・Ctrl+Z）は必ず `DisableColorSchemeUpdates`
-/// を送る — 外し忘れると、子の akapen や後のシェルに知らせが届き、crossterm で
-/// 読むものはそこで止まる。
+/// 配色の知らせ（モード 2031）の購読はここではなく [`TermGuard::scheme`]
+/// が張り外しする（固定なら張らない）。
 fn enter_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
     use ratatui::crossterm::QueueableCommand;
     w.queue(EnterAlternateScreen)?;
     w.queue(Hide)?;
     w.queue(EnableMouseCapture)?;
     w.queue(EnableFocusChange)?;
-    w.queue(EnableColorSchemeUpdates)?;
     w.flush()
 }
 
-/// 子プロセス（や Ctrl+Z の停止）から戻ったときの [`enter_tui_modes`]。
-/// 離れている間に配色が変わったかもしれないので、今の配色も問い合わせる
-/// （`CSI ? 996 n`。答えは知らせと同じ形で届き、[`App::follow_scheme`] が拾う）。
-fn resume_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    use ratatui::crossterm::QueueableCommand;
-    enter_tui_modes(w)?;
-    w.queue(QueryColorScheme)?;
-    w.flush()
-}
-
-/// 端末を手放すときに戻すもの — [`enter_tui_modes`] の逆で、配色の知らせの
-/// 購読も外す。終わるとき（[`TermGuard`] の Drop。panic の巻き戻しも）・
-/// シグナル（[`install_signal_handlers`] が前もって列にしておく）・Ctrl+Z
-/// （[`suspend_tui`]）で使う。
+/// 端末を手放すときに戻すもの — [`enter_tui_modes`] の逆。終わるとき
+/// （[`TermGuard`] の Drop。panic の巻き戻しも）・シグナル
+/// （[`install_signal_handlers`] が前もって列にしておく）・Ctrl+Z
+/// （[`suspend_tui`]）で使う。配色の知らせの購読は、この前に
+/// [`TermGuard::scheme`] が外す。
 fn leave_tui_modes(w: &mut impl std::io::Write) -> std::io::Result<()> {
     ratatui::crossterm::queue!(
         w,
         Show,
         DisableMouseCapture,
         LeaveAlternateScreen,
-        DisableFocusChange,
-        DisableColorSchemeUpdates
+        DisableFocusChange
     )?;
     w.flush()
 }
 
 /// 子プロセス（`--open-cmd` の akapen など）に端末を渡す前に戻すもの。
-/// フォーカスの報告は今までどおり残す（子の多くは自分で張り、出るときに外す）
-/// が、配色の知らせの購読は必ず外す — 子の akapen は自分で購読し、crossterm で
-/// 読む子は届いた知らせで止まる。
+/// フォーカスの報告は今までどおり残す（子の多くは自分で張り、出るときに外す）。
+/// 配色の知らせの購読は、この前に [`TermGuard::scheme`] が必ず外す — 子の
+/// akapen は自分で購読し、crossterm で読む子は届いた知らせで止まる。
 fn leave_for_child(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    execute!(
-        w,
-        LeaveAlternateScreen,
-        Show,
-        DisableMouseCapture,
-        DisableColorSchemeUpdates
-    )
+    execute!(w, LeaveAlternateScreen, Show, DisableMouseCapture)
 }
 
 /// When stdin is not a terminal (xargs gives children /dev/null; scripts
@@ -1262,6 +1242,14 @@ struct TermGuard {
     raw: bool,
     /// The alternate screen is currently entered.
     alt: bool,
+    /// 配色の知らせ（モード 2031）の購読。購読は端末の状態で、プロセスが
+    /// 終わっても残るので、端末を手放すとき（終わるとき・panic・シグナル・
+    /// 子プロセスに渡すとき・Ctrl+Z）は必ず外す — 外し忘れると、子の akapen や
+    /// 後のシェルに知らせが届き、crossterm で読むものはそこで止まる。張り外しは
+    /// termtheme の [`Subscription`] が受け持つ（子に渡しているあいだは、落ちても
+    /// 書かない）。書き先は [`make_terminal`] と同じ選び方（`Subscription::new`）。
+    /// `--light` / `--dark` で固定したときは `Subscription::fixed` で、何も書かない。
+    scheme: Subscription,
 }
 
 impl TermGuard {
@@ -1277,6 +1265,35 @@ impl TermGuard {
         self.raw = false;
         TUI_ACTIVE.store(false, Ordering::SeqCst);
     }
+
+    /// 起動時: TUI のモードに入り、配色の知らせの購読を始める（起動時の判定
+    /// — OSC 11 — の後で呼ぶ。問い合わせはしない）。
+    fn enter(&mut self) {
+        let _ = enter_tui_modes(self.backend_mut());
+        self.alt = true;
+        let _ = self.scheme.start();
+    }
+
+    /// 端末を手放す — 子プロセスに渡す前（`leave` は [`leave_for_child`]）と
+    /// Ctrl+Z で止まる前（[`leave_tui_modes`]）。購読を先に外し、戻るまでは
+    /// 落ちても書かない（端末は子やシェルのもの）。
+    fn hand_off(
+        &mut self,
+        leave: fn(&mut CrosstermBackend<Box<dyn std::io::Write>>) -> std::io::Result<()>,
+    ) {
+        let _ = self.scheme.suspend();
+        let _ = leave(self.backend_mut());
+        self.alt = false;
+    }
+
+    /// 端末が戻った（作り直した [`Term`] を入れた後）: TUI のモードに入り直し、
+    /// 購読を張り直して、離れている間に変わったかもしれない今の配色を問い合わせる
+    /// （`CSI ? 996 n`。答えは知らせと同じ形で届き、[`App::follow_scheme`] が拾う）。
+    fn take_back(&mut self) {
+        let _ = enter_tui_modes(self.backend_mut());
+        self.alt = true;
+        let _ = self.scheme.resume();
+    }
 }
 
 impl Drop for TermGuard {
@@ -1284,6 +1301,9 @@ impl Drop for TermGuard {
         // The signal handler must not restore after we have (a signal
         // landing mid-restore would double-leave the alternate screen).
         TUI_ACTIVE.store(false, Ordering::SeqCst);
+        // 購読を先に外す（子に渡しているあいだは何も書かない）。フィールドの
+        // Drop はこの本体の後なので、順を決めるためにここで stop する。
+        let _ = self.scheme.stop();
         if self.alt && let Some(t) = &mut self.term {
             let _ = leave_tui_modes(t.backend_mut());
         }
@@ -1316,16 +1336,20 @@ impl std::ops::DerefMut for TermGuard {
 /// the handler itself must not allocate or open anything).
 static TERMINAL_RESTORE: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// SIGINT/SIGTERM handler: leave the alternate screen (and show the
-/// cursor, stop mouse/focus reporting and the color-scheme
-/// subscription), then re-raise with the default
+/// SIGINT/SIGTERM handler: drop the color-scheme subscription, leave the
+/// alternate screen (and show the cursor, stop mouse/focus reporting),
+/// then re-raise with the default
 /// disposition so the process dies with the conventional signal status.
-/// The handler writes only to the already-open stdout/stderr fds: on
+/// The handler writes only to already-open fds: on
 /// macOS, opening /dev/tty or calling tcsetattr from a handler races
 /// with process exit (with crossterm's kqueue in flight) and can hang
 /// the dying process in the kernel. Raw mode is left to the shell,
 /// which restores the termios when the job dies.
 extern "C" fn restore_terminal_and_die(sig: libc::c_int) {
+    // 配色の知らせの購読を外す。termtheme が、張っているときだけ、
+    // Subscription の書き先（開いてある fd）へ write(2) する — 固定・子に
+    // 渡しているあいだ・外した後は何もしない（async-signal-safe）。
+    termtheme::scheme::unsubscribe_in_signal_handler();
     if TUI_ACTIVE.load(Ordering::SeqCst) {
         // Both fds are the terminal in the normal case; when stdout is
         // piped (--output), stderr still is.
@@ -1386,6 +1410,12 @@ fn run(config: Config) -> Result<()> {
         term: None,
         raw: false,
         alt: false,
+        // 固定（--light / --dark）なら購読しない: 固定は固定。
+        scheme: if config.light.is_some() {
+            Subscription::fixed()
+        } else {
+            Subscription::new()
+        },
     };
     guard.raw_on();
     // 起動時の判定の待ちのあいだに打たれたキー（先打ち）は、termtheme が捨てずに
@@ -1440,8 +1470,7 @@ fn run(config: Config) -> Result<()> {
     app.show_dirs = app.config.show_dirs;
     let terminal = make_terminal()?; // the guard restores raw mode on error
     guard.term = Some(terminal);
-    let _ = enter_tui_modes(guard.backend_mut());
-    guard.alt = true;
+    guard.enter();
     // The first scan blocks the event loop — on a huge tree it takes
     // seconds, and with the alternate screen already up that reads as a
     // frozen/black screen. Draw a "scanning" status before the scan;
@@ -1844,9 +1873,8 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
         // editor pattern): leave the alternate screen and raw mode, and
         // disarm the guard — the child owns the terminal now, so a
         // panic or signal mid-child must not restore it out from under
-        // the child. 配色の知らせの購読も外す（leave_for_child）。
-        let _ = leave_for_child(g.backend_mut());
-        g.alt = false;
+        // the child. 配色の知らせの購読も先に外す（hand_off）。
+        g.hand_off(leave_for_child);
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
         g.raw_off();
     }
@@ -1893,8 +1921,7 @@ fn open_with_cmd(app: &mut App, mut terminal: Option<&mut TermGuard>, cmd: &str)
                 // the child may have sent DisableFocusChange on its way
                 // out, which would kill the away-diff silently. 購読も
                 // 張り直し、離れている間に変わった配色を問い合わせる。
-                let _ = resume_tui_modes(g.backend_mut());
-                g.alt = true;
+                g.take_back();
             }
             Err(e) => {
                 app.flash_err(format!("terminal restore failed: {e:#}"));
@@ -1952,8 +1979,7 @@ fn suspend_tui(app: &mut App, terminal: Option<&mut TermGuard>) {
         app.flash("not a foreground job — can't suspend");
         return;
     }
-    let _ = leave_tui_modes(g.backend_mut());
-    g.alt = false;
+    g.hand_off(leave_tui_modes);
     let _ = ratatui::crossterm::terminal::disable_raw_mode();
     g.raw_off();
     unsafe {
@@ -1968,8 +1994,7 @@ fn suspend_tui(app: &mut App, terminal: Option<&mut TermGuard>) {
     match make_terminal() {
         Ok(term) => {
             **g = term;
-            let _ = resume_tui_modes(g.backend_mut());
-            g.alt = true;
+            g.take_back();
         }
         Err(e) => {
             app.flash_err(format!("terminal restore failed: {e:#}"));
@@ -3442,39 +3467,64 @@ mod tests {
         .unwrap()
     }
 
+    /// A guard over [`buf_terminal`] whose color-scheme subscription writes
+    /// to the same buffer, so the test sees both in the order written.
+    /// `fixed` is the `--light` / `--dark` shape (`Subscription::fixed`).
+    fn buf_guard(buf: &SharedBuf, fixed: bool) -> TermGuard {
+        TermGuard {
+            term: Some(buf_terminal(buf)),
+            raw: false,
+            alt: false,
+            scheme: if fixed {
+                Subscription::fixed()
+            } else {
+                Subscription::with_writer(buf.clone())
+            },
+        }
+    }
+
+    impl SharedBuf {
+        /// Everything written so far, emptying the buffer.
+        fn take(&self) -> String {
+            String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+        }
+    }
+
     #[test]
     fn term_guard_drop_restores_entered_terminal_state() {
         // Normal exit: raw mode on, alternate screen entered — Drop
         // must leave the alternate screen, show the cursor, and stop
         // mouse/focus reporting (the shell's screen restored).
         let buf = SharedBuf::default();
-        let guard = TermGuard {
-            term: Some(buf_terminal(&buf)),
-            raw: true,
-            alt: true,
-        };
+        let mut guard = buf_guard(&buf, false);
+        guard.raw = true;
+        guard.enter();
+        buf.take();
         drop(guard);
-        let locked = buf.0.lock().unwrap();
-        let bytes = String::from_utf8_lossy(&locked[..]);
+        let bytes = buf.take();
         assert!(bytes.contains("\x1b[?1049l"), "leaves the alternate screen");
         assert!(bytes.contains("\x1b[?25h"), "shows the cursor");
         assert!(bytes.contains("\x1b[?1000l"), "disables mouse capture");
         assert!(bytes.contains("\x1b[?1004l"), "disables focus reporting");
+        assert!(
+            bytes.starts_with("\x1b[?2031l"),
+            "drops the color-scheme subscription first: {bytes:?}"
+        );
     }
 
     #[test]
     fn term_guard_drop_is_a_noop_while_a_child_owns_the_terminal() {
         // open_selection's child window: raw mode off and the alternate
         // screen left — Drop must not restore anything (the child owns
-        // the terminal; a second teardown would corrupt its screen).
+        // the terminal; a second teardown would corrupt its screen, and
+        // the subscription the child may have made is the child's).
         let buf = SharedBuf::default();
-        let guard = TermGuard {
-            term: Some(buf_terminal(&buf)),
-            raw: false,
-            alt: false,
-        };
+        let mut guard = buf_guard(&buf, false);
+        guard.enter();
+        guard.hand_off(leave_for_child);
+        buf.take();
         drop(guard);
-        assert!(buf.0.lock().unwrap().is_empty());
+        assert_eq!(buf.take(), "");
     }
 
     #[test]
@@ -3485,6 +3535,7 @@ mod tests {
             term: None,
             raw: true,
             alt: false,
+            scheme: Subscription::fixed(),
         };
         drop(guard);
     }
@@ -4086,32 +4137,69 @@ mod tests {
         );
     }
 
+    const SUBSCRIBE: &str = "\x1b[?2031h";
+    const UNSUBSCRIBE: &str = "\x1b[?2031l";
+    const QUERY_SCHEME: &str = "\x1b[?996n";
+    const ALT_IN: &str = "\x1b[?1049h";
+    const ALT_OUT: &str = "\x1b[?1049l";
+
+    /// 起動 → `--open-cmd` の子に渡して戻る → Ctrl+Z で止まって `fg` で戻る →
+    /// 終わる（`q`）を通し、購読の列と代替画面の出入りを書いた順に並べる。
+    fn hand_off_sequence(fixed: bool) -> Vec<&'static str> {
+        let buf = SharedBuf::default();
+        let mut guard = buf_guard(&buf, fixed);
+        guard.enter();
+        guard.hand_off(leave_for_child);
+        guard.take_back();
+        guard.hand_off(leave_tui_modes);
+        guard.take_back();
+        drop(guard);
+        let written = buf.take();
+        let mut found: Vec<(usize, &'static str)> =
+            [SUBSCRIBE, UNSUBSCRIBE, QUERY_SCHEME, ALT_IN, ALT_OUT]
+                .into_iter()
+                .flat_map(|seq| written.match_indices(seq).map(move |(at, _)| (at, seq)))
+                .collect();
+        found.sort();
+        found.into_iter().map(|(_, seq)| seq).collect()
+    }
+
     #[test]
-    fn the_tui_subscribes_and_unsubscribes_before_every_hand_off() {
-        let bytes = |f: fn(&mut Vec<u8>) -> std::io::Result<()>| {
-            let mut out = Vec::new();
-            f(&mut out).unwrap();
-            String::from_utf8(out).unwrap()
-        };
-        let enter = bytes(enter_tui_modes);
-        assert!(enter.contains("\x1b[?2031h"), "起動時に購読する");
-        assert!(
-            !enter.contains("\x1b[?996n"),
-            "起動時の判定は OSC 11 のまま"
+    fn the_tui_subscribes_and_unsubscribes_around_every_hand_off() {
+        assert_eq!(
+            hand_off_sequence(false),
+            [
+                // 起動: 画面に入ってから張る。起動時の判定は OSC 11 のままで、
+                // 問い合わせない。
+                ALT_IN,
+                SUBSCRIBE,
+                // 子に渡す前に外す。
+                UNSUBSCRIBE,
+                ALT_OUT,
+                // 戻ったら張り直してから、離れている間に変わった分を問い合わせる。
+                ALT_IN,
+                SUBSCRIBE,
+                QUERY_SCHEME,
+                // Ctrl+Z で止まる前にも外し、fg で戻ったら同じく張り直す。
+                UNSUBSCRIBE,
+                ALT_OUT,
+                ALT_IN,
+                SUBSCRIBE,
+                QUERY_SCHEME,
+                // 終わるとき。
+                UNSUBSCRIBE,
+                ALT_OUT,
+            ]
         );
-        // 戻ったら張り直してから、離れている間に変わった分を問い合わせる。
-        let resume = bytes(resume_tui_modes);
-        let subscribe = resume.find("\x1b[?2031h").expect("張り直す");
-        let query = resume.find("\x1b[?996n").expect("問い合わせる");
-        assert!(subscribe < query);
-        // 終わるとき・シグナル・Ctrl+Z（leave_tui_modes）と子に渡すとき
-        // （leave_for_child）は外す。
-        for (name, seq) in [
-            ("leave_tui_modes", bytes(leave_tui_modes)),
-            ("leave_for_child", bytes(leave_for_child)),
-        ] {
-            assert!(seq.contains("\x1b[?2031l"), "{name}");
-            assert!(!seq.contains("\x1b[?2031h"), "{name}");
-        }
+    }
+
+    #[test]
+    fn a_fixed_light_or_dark_never_subscribes() {
+        // --light / --dark で固定したときは、どの手放しでも購読の列を書かない
+        // （画面の出入りは同じ）。
+        assert_eq!(
+            hand_off_sequence(true),
+            [ALT_IN, ALT_OUT, ALT_IN, ALT_OUT, ALT_IN, ALT_OUT]
+        );
     }
 }
